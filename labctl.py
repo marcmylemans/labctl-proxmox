@@ -5,6 +5,8 @@ from pathlib import Path
 import yaml
 import winrm
 from proxmoxer import ProxmoxAPI
+from dotenv import load_dotenv
+load_dotenv()
 
 def env(name, default=None, required=False):
     v = os.getenv(name, default)
