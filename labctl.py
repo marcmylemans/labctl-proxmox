@@ -1,66 +1,53 @@
 #!/usr/bin/env python3
 """
-labctl.py — Proxmox lab controller (YAML-driven) with:
-- Proxmox API token auth via proxmoxer (supports .env via python-dotenv)
-- VM clone/start/destroy
-- QEMU Guest Agent IPv4 discovery (so lab.yaml doesn't need hardcoded IPs)
-- WinRM execution for:
-    - per-VM bootstrap (DC promote / domain join)
-    - per-lab break scripts
+labctl.py — Proxmox lab controller (with auto-cleanup + env injection)
 
-Requires:
+Requirements:
   pip install proxmoxer pyyaml pywinrm python-dotenv
 """
 
 from __future__ import annotations
 
 import argparse
+import base64
 import ipaddress
 import os
-import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Tuple, Optional
 
 import yaml
 import winrm
 from dotenv import load_dotenv
 from proxmoxer import ProxmoxAPI
 
-# Load .env from CWD (recommended: run labctl from repo root)
+# -----------------------------
+# ENV
+# -----------------------------
 load_dotenv()
 
-
-# -----------------------------
-# Env helpers
-# -----------------------------
-
-def env_str(name: str, default: Optional[str] = None, required: bool = False) -> str:
+def env_str(name: str, default=None, required=False) -> str:
     v = os.getenv(name, default)
-    if required and (v is None or str(v).strip() == ""):
+    if required and not v:
         raise RuntimeError(f"Missing env var: {name}")
-    return str(v) if v is not None else ""
+    return str(v)
 
-
-def env_bool(name: str, default: bool = True) -> bool:
+def env_bool(name: str, default=True) -> bool:
     v = os.getenv(name)
     if v is None:
         return default
     return v.strip().lower() not in ("0", "false", "no", "off")
 
-
-PVE_HOST = env_str("PVE_HOST", required=True)
-PVE_USER = env_str("PVE_USER", required=True)
-PVE_REALM = env_str("PVE_REALM", "pam")
-PVE_TOKEN_NAME = env_str("PVE_TOKEN_NAME", required=True)
+PVE_HOST        = env_str("PVE_HOST", required=True)
+PVE_USER        = env_str("PVE_USER", required=True)
+PVE_REALM       = env_str("PVE_REALM", "pam")
+PVE_TOKEN_NAME  = env_str("PVE_TOKEN_NAME", required=True)
 PVE_TOKEN_VALUE = env_str("PVE_TOKEN_VALUE", required=True)
-PVE_VERIFY_SSL = env_bool("PVE_VERIFY_SSL", True)
-
+PVE_VERIFY_SSL  = env_bool("PVE_VERIFY_SSL", True)
 
 # -----------------------------
-# Proxmox connect / task wait
+# PROXMOX
 # -----------------------------
-
 def proxmox() -> ProxmoxAPI:
     return ProxmoxAPI(
         PVE_HOST,
@@ -70,507 +57,420 @@ def proxmox() -> ProxmoxAPI:
         verify_ssl=PVE_VERIFY_SSL,
     )
 
-
-def wait_task(p: ProxmoxAPI, node: str, upid: str, timeout_s: int = 900) -> None:
+def wait_task(p, node, upid, timeout=900):
     start = time.time()
     while True:
         t = p.nodes(node).tasks(upid).status.get()
-        if t.get("status") == "stopped":
-            exitstatus = t.get("exitstatus")
-            if exitstatus and exitstatus != "OK":
-                raise RuntimeError(f"Task failed: {upid} exitstatus={exitstatus}")
+        if t["status"] == "stopped":
+            if t.get("exitstatus") not in (None, "OK"):
+                raise RuntimeError(f"Task failed: {t}")
             return
-        if time.time() - start > timeout_s:
-            raise TimeoutError(f"Task timeout after {timeout_s}s: {upid}")
+        if time.time() - start > timeout:
+            raise TimeoutError("Proxmox task timeout")
         time.sleep(2)
 
-
-def vm_exists(p: ProxmoxAPI, node: str, vmid: int) -> bool:
+def vm_exists(p, node, vmid) -> bool:
     try:
-        _ = p.nodes(node).qemu(vmid).status.current.get()
+        p.nodes(node).qemu(vmid).status.current.get()
         return True
     except Exception:
         return False
 
-
 # -----------------------------
-# Lab YAML
+# YAML
 # -----------------------------
-
 def load_lab(path: Path) -> Dict[str, Any]:
     lab = yaml.safe_load(path.read_text(encoding="utf-8"))
-    if not isinstance(lab, dict):
-        raise RuntimeError("Invalid lab.yaml (must be a YAML mapping)")
-    for k in ("proxmox", "vms"):
-        if k not in lab:
-            raise RuntimeError(f"Invalid lab.yaml: missing '{k}'")
-    if "node" not in lab["proxmox"]:
-        raise RuntimeError("Invalid lab.yaml: proxmox.node required")
+    if "proxmox" not in lab or "vms" not in lab:
+        raise RuntimeError("Invalid lab.yaml (missing proxmox/vms)")
+    if "winrm" not in lab:
+        raise RuntimeError("Invalid lab.yaml (missing winrm)")
     return lab
 
-
-def read_script_text(base_path: Path, rel_path: str) -> str:
-    p = (base_path.parent / rel_path).resolve()
+def read_script(base: Path, rel: str) -> str:
+    p = (base.parent / rel).resolve()
     if not p.exists():
-        raise FileNotFoundError(f"Script not found: {p}")
+        raise FileNotFoundError(p)
     return p.read_text(encoding="utf-8")
 
+def sanitize_tag(s: str) -> str:
+    return "".join(c if c.isalnum() or c in "-._" else "-" for c in str(s)).strip("-") or "lab"
 
 # -----------------------------
-# Proxmox tag safety
+# LAB ENV (inject to scripts)
 # -----------------------------
+def lab_env(lab: Dict[str, Any], vmname: str) -> Dict[str, str]:
+    """
+    Build environment variables for bootstrap/break scripts.
+    Reads from lab.yaml 'lab:' section.
+    """
+    cfg = lab.get("lab", {}) or {}
+    env: Dict[str, str] = {}
 
-def sanitize_tag(t: str) -> str:
-    # Proxmox tag allowed chars: letters/digits and _ . -
-    out = []
-    for ch in str(t).strip():
-        if ch.isalnum() or ch in ("_", "-", "."):
-            out.append(ch)
-        else:
-            out.append("-")
-    s = "".join(out).strip("-")
-    return s or "tag"
+    # Domain (optional - scripts have defaults)
+    if "domain_fqdn" in cfg:
+        env["LAB_DOMAIN_FQDN"] = str(cfg["domain_fqdn"])
+    if "domain_netbios" in cfg:
+        env["LAB_DOMAIN_NETBIOS"] = str(cfg["domain_netbios"])
 
+    # Network
+    if "prefix" in cfg:
+        env["LAB_PREFIX"] = str(cfg["prefix"])
+    if "gateway" in cfg:
+        env["LAB_GW"] = str(cfg["gateway"])
+
+    # DC IP (required by dc script)
+    if "dc_ip" in cfg:
+        env["LAB_DC_IP"] = str(cfg["dc_ip"])
+
+    # Optional DSRM password
+    if "dsrm_pass" in cfg:
+        env["LAB_DSRM_PASS"] = str(cfg["dsrm_pass"])
+
+    # DHCP (optional)
+    dhcp = cfg.get("dhcp", {}) or {}
+    if "scope_net" in dhcp:
+        env["LAB_SCOPE_NET"] = str(dhcp["scope_net"])
+    if "start" in dhcp:
+        env["LAB_SCOPE_START"] = str(dhcp["start"])
+    if "end" in dhcp:
+        env["LAB_SCOPE_END"] = str(dhcp["end"])
+
+    # Domain join creds (WS script requires JOIN_PASS)
+    # For now we reuse the same password you already use everywhere.
+    winrm_cfg = lab.get("winrm", {}) or {}
+    if "password" in winrm_cfg:
+        env["LAB_JOIN_PASS"] = str(winrm_cfg["password"])
+
+    # Optional override join user (else WS script builds CORP\Administrator)
+    if "join_user" in cfg:
+        env["LAB_JOIN_USER"] = str(cfg["join_user"])
+
+    # Per-VM
+    env["LAB_VM_NAME"] = vmname
+
+    return env
+
+def _escape_for_cmd_set(value: str) -> str:
+    """
+    Escape characters that break CMD 'set "K=V" && ...' chains.
+    """
+    v = str(value)
+    v = v.replace("^", "^^").replace("&", "^&").replace("<", "^<").replace(">", "^>")
+    return v
 
 # -----------------------------
-# QEMU Guest Agent IPv4 discovery
+# GUEST AGENT (IP)
 # -----------------------------
-
-def agent_call(p: ProxmoxAPI, node: str, vmid: int, cmd: str) -> Dict[str, Any]:
+def agent_call(p, node, vmid, cmd):
     return p.nodes(node).qemu(vmid).agent(cmd).get()
 
-
-def wait_guest_agent(p: ProxmoxAPI, node: str, vmid: int, retries: int = 60, delay_s: int = 3) -> None:
-    last = None
-    for _ in range(retries):
-        try:
-            _ = p.nodes(node).qemu(vmid).agent("ping").get()
-            return
-        except Exception as e:
-            last = str(e)
-            time.sleep(delay_s)
-    raise TimeoutError(f"Guest agent not ready (vmid={vmid} node={node}). Last error: {last}")
-
-
-def flatten_ipv4_from_agent(netinfo: Dict[str, Any]) -> List[str]:
-    ips: List[str] = []
-    for iface in netinfo.get("result", []):
-        for addr in iface.get("ip-addresses", []):
-            if addr.get("ip-address-type") == "ipv4":
-                ip = addr.get("ip-address")
-                if not ip:
-                    continue
-                if ip.startswith("127.") or ip.startswith("169.254."):
-                    continue
-                ips.append(ip)
+def flatten_ipv4(info):
+    ips = []
+    for iface in info.get("result", []):
+        for a in iface.get("ip-addresses", []):
+            if a.get("ip-address-type") == "ipv4":
+                ip = a.get("ip-address")
+                if ip and not ip.startswith(("127.", "169.254.")):
+                    ips.append(ip)
     return ips
 
+def wait_guest_agent(p, node, vmid):
+    last = None
+    for _ in range(80):
+        try:
+            info = agent_call(p, node, vmid, "network-get-interfaces")
+            ips = flatten_ipv4(info)
+            if ips:
+                return ips
+            last = "agent ok, no IP yet"
+        except Exception as e:
+            msg = str(e)
+            if "501" in msg:
+                raise RuntimeError("Guest agent endpoint disabled (qm set <id> --agent 1)")
+            last = msg
+        time.sleep(3)
+    raise TimeoutError(f"Guest agent not ready: {last}")
 
-def pick_best_ip(ips: List[str], preferred_subnets: List[str]) -> str:
-    if not ips:
-        raise RuntimeError("Guest agent returned no usable IPv4 addresses.")
-    if preferred_subnets:
-        nets = [ipaddress.ip_network(s, strict=False) for s in preferred_subnets]
+def resolve_vm_ip(p, lab, vmname):
+    vm = lab["vms"][vmname]
+    if vm.get("ip"):
+        return vm["ip"]
+    node = lab["proxmox"]["node"]
+    ips = wait_guest_agent(p, node, int(vm["vmid"]))
+    preferred = lab.get("network", {}).get("prefer_ipv4_subnets", [])
+    if preferred:
+        nets = [ipaddress.ip_network(n, strict=False) for n in preferred]
         for ip in ips:
-            ip_obj = ipaddress.ip_address(ip)
-            if any(ip_obj in n for n in nets):
+            if any(ipaddress.ip_address(ip) in n for n in nets):
                 return ip
     return ips[0]
 
-
-def resolve_vm_ipv4(p: ProxmoxAPI, node: str, vmid: int, preferred_subnets: List[str]) -> str:
-    wait_guest_agent(p, node, vmid)
-    netinfo = agent_call(p, node, vmid, "network-get-interfaces")
-    ips = flatten_ipv4_from_agent(netinfo)
-    return pick_best_ip(ips, preferred_subnets)
-
-
-def get_target_host(p: ProxmoxAPI, lab: Dict[str, Any], vm_name: str) -> str:
-    node = str(lab["proxmox"]["node"])
-    vms = lab["vms"]
-    if vm_name not in vms:
-        raise RuntimeError(f"VM '{vm_name}' not found in lab.vms")
-
-    vm = vms[vm_name]
-    # Backward compatible: if ip is provided, use it.
-    if vm.get("ip"):
-        return str(vm["ip"])
-
-    preferred = (lab.get("network") or {}).get("prefer_ipv4_subnets", [])
-    return resolve_vm_ipv4(p, node, int(vm["vmid"]), preferred)
-
-
 # -----------------------------
-# WinRM execution
+# WINRM (CMD ONLY)
 # -----------------------------
+def winrm_cfg(lab):
+    w = lab["winrm"]
+    return dict(
+        username=w["username"],
+        password=w["password"],
+        transport=w.get("transport", "ntlm"),
+        use_ssl=bool(w.get("use_ssl", False)),
+        port=int(w.get("port", 5986 if w.get("use_ssl") else 5985)),
+        server_cert_validation=w.get("server_cert_validation", "ignore"),
+    )
 
-def winrm_cfg(lab: Dict[str, Any]) -> Dict[str, Any]:
-    w = lab.get("winrm") or {}
-    for k in ("username", "password"):
-        if not w.get(k):
-            raise RuntimeError(f"lab.yaml missing winrm.{k}")
-    return {
-        "username": w["username"],
-        "password": w["password"],
-        "transport": w.get("transport", "ntlm"),
-        "use_ssl": bool(w.get("use_ssl", False)),
-        "port": int(w.get("port", 5986 if w.get("use_ssl") else 5985)),
-        "server_cert_validation": w.get("server_cert_validation", "ignore"),
-    }
-
-
-def run_ps_winrm(lab: Dict[str, Any], host: str, ps_script: str, timeout_s: int = 120) -> Tuple[int, str, str]:
+def winrm_session(lab, host) -> winrm.Session:
     w = winrm_cfg(lab)
     scheme = "https" if w["use_ssl"] else "http"
-    endpoint = f"{scheme}://{host}:{w['port']}/wsman"
-
-    sess = winrm.Session(
-        target=endpoint,
+    url = f"{scheme}://{host}:{w['port']}/wsman"
+    return winrm.Session(
+        url,
         auth=(w["username"], w["password"]),
         transport=w["transport"],
         server_cert_validation=w["server_cert_validation"],
     )
-    r = sess.run_ps(ps_script, timeout=timeout_s)
 
-    stdout = (r.std_out or b"").decode(errors="replace").strip()
-    stderr = (r.std_err or b"").decode(errors="replace").strip()
-    return int(r.status_code), stdout, stderr
-
-
-def wait_winrm(lab: Dict[str, Any], host: str, retries: int = 50, delay_s: int = 5) -> None:
-    probe = "Write-Output 'winrm-ok'"
+def wait_winrm(lab, host):
     last = None
-    for _ in range(retries):
+    for _ in range(60):
         try:
-            code, out, err = run_ps_winrm(lab, host, probe, timeout_s=20)
-            if code == 0 and "winrm-ok" in out:
+            sess = winrm_session(lab, host)
+            r = sess.run_cmd("cmd.exe", ["/c", "echo winrm-ok"])
+            if r.status_code == 0:
                 return
-            last = f"code={code} out={out} err={err}"
+            last = (r.std_err or r.std_out or b"").decode(errors="replace")
         except Exception as e:
             last = str(e)
-        time.sleep(delay_s)
-    raise TimeoutError(f"WinRM not reachable on {host}. Last error: {last}")
+        time.sleep(5)
+    raise TimeoutError(f"WinRM not reachable on {host}: {last}")
 
+REMOTE_DIR  = r"C:\Windows\Temp\labctl"
+CHUNK_BYTES = 12000
+
+def upload_text_as_ps1(lab, host, text: str, remote_name: str) -> str:
+    remote_ps1 = fr"{REMOTE_DIR}\{remote_name}"
+    remote_b64 = fr"{remote_ps1}.b64"
+    sess = winrm_session(lab, host)
+
+    # prep
+    for c in [
+        f'mkdir "{REMOTE_DIR}"',
+        f'del /f /q "{remote_b64}" 2>nul',
+        f'del /f /q "{remote_ps1}" 2>nul',
+    ]:
+        r = sess.run_cmd("cmd.exe", ["/c", c])
+        if r.status_code != 0:
+            raise RuntimeError((r.std_err or b"").decode(errors="replace"))
+
+    # upload base64
+    b64 = base64.b64encode(text.encode("utf-8")).decode("ascii")
+    for i in range(0, len(b64), CHUNK_BYTES):
+        chunk = b64[i:i + CHUNK_BYTES]
+        r = sess.run_cmd("cmd.exe", ["/c", f'echo {chunk}>>"{remote_b64}"'])
+        if r.status_code != 0:
+            raise RuntimeError((r.std_err or b"").decode(errors="replace"))
+
+    # decode (no powershell, avoids WinRM 400/XML issues)
+    r = sess.run_cmd("cmd.exe", ["/c", f'certutil -f -decode "{remote_b64}" "{remote_ps1}" >nul'])
+    if r.status_code != 0:
+        out = (r.std_out or b"").decode(errors="replace")
+        err = (r.std_err or b"").decode(errors="replace")
+        raise RuntimeError(f"certutil decode failed: {out}\n{err}")
+
+    return remote_ps1
+
+def exec_remote_ps1(lab, host, remote_ps1: str, env: Optional[Dict[str, str]] = None):
+    """
+    Execute a .ps1 remotely while injecting env vars via CMD.
+    Avoids run_ps() entirely.
+    """
+    sess = winrm_session(lab, host)
+
+    set_parts: List[str] = []
+    if env:
+        for k, v in env.items():
+            set_parts.append(f'set "{k}={_escape_for_cmd_set(v)}"')
+
+    ps_cmd = fr'powershell -NoProfile -ExecutionPolicy Bypass -File "{remote_ps1}"'
+    full_cmd = " && ".join(set_parts + [ps_cmd]) if set_parts else ps_cmd
+
+    r = sess.run_cmd("cmd.exe", ["/c", full_cmd])
+    out = (r.std_out or b"").decode(errors="replace")
+    err = (r.std_err or b"").decode(errors="replace")
+    return int(r.status_code), out, err
 
 # -----------------------------
-# VM operations
+# VM OPS
 # -----------------------------
-
-def clone_vm(
-    p: ProxmoxAPI,
-    node: str,
-    template_id: int,
-    vmid: int,
-    name: str,
-    full: bool = True,
-    storage: Optional[str] = None,
-    tags: Optional[List[str]] = None,
-) -> None:
+def clone_vm(p, node, template, vmid, name, tags):
     if vm_exists(p, node, vmid):
-        raise RuntimeError(f"VMID {vmid} already exists on node {node}")
-
-    payload: Dict[str, Any] = {"newid": vmid, "name": name, "full": 1 if full else 0}
-    if storage:
-        payload["storage"] = storage
-
-    upid = p.nodes(node).qemu(template_id).clone.post(**payload)
+        raise RuntimeError(f"VMID {vmid} already exists")
+    upid = p.nodes(node).qemu(template).clone.post(newid=vmid, name=name, full=1)
     wait_task(p, node, upid)
+    p.nodes(node).qemu(vmid).config.post(tags=",".join(tags))
 
-    if tags:
-        upid = p.nodes(node).qemu(vmid).config.post(tags=",".join(tags))
-        wait_task(p, node, upid)
-
-
-def start_vm(p: ProxmoxAPI, node: str, vmid: int) -> None:
+def start_vm(p, node, vmid):
     upid = p.nodes(node).qemu(vmid).status.start.post()
     wait_task(p, node, upid)
 
-
-def stop_vm(p: ProxmoxAPI, node: str, vmid: int) -> None:
+def stop_vm(p, node, vmid):
     try:
-        upid = p.nodes(node).qemu(vmid).status.shutdown.post(timeout=90)
-        wait_task(p, node, upid, timeout_s=180)
+        upid = p.nodes(node).qemu(vmid).status.shutdown.post(timeout=60)
+        wait_task(p, node, upid)
     except Exception:
         upid = p.nodes(node).qemu(vmid).status.stop.post()
-        wait_task(p, node, upid, timeout_s=180)
+        wait_task(p, node, upid)
 
-
-def destroy_vm(p: ProxmoxAPI, node: str, vmid: int) -> None:
+def destroy_vm(p, node, vmid):
     upid = p.nodes(node).qemu(vmid).delete()
     wait_task(p, node, upid)
 
+# -----------------------------
+# ORDERING
+# -----------------------------
+def ordered_vms(lab):
+    return sorted(lab["vms"].items(), key=lambda kv: 0 if kv[1].get("role") == "dc" else 1)
 
 # -----------------------------
-# Lab orchestration helpers
+# BOOTSTRAP / BREAK
 # -----------------------------
-
-def ordered_vms(lab: Dict[str, Any]) -> List[Tuple[str, Dict[str, Any]]]:
-    """
-    Start order:
-      1) role == 'dc'
-      2) everything else
-    """
-    items = list(lab["vms"].items())
-    return sorted(items, key=lambda kv: 0 if str(kv[1].get("role", "")).lower() == "dc" else 1)
-
-
-def apply_bootstrap(lab_path: Path, lab: Dict[str, Any], p: ProxmoxAPI, vm_name: str) -> None:
-    vm = lab["vms"][vm_name]
-    script_rel = vm.get("bootstrap")
-    if not script_rel:
-        print(f"No bootstrap defined for {vm_name}, skipping.")
+def bootstrap_vm(lab_path, lab, p, vmname):
+    vm = lab["vms"][vmname]
+    rel = vm.get("bootstrap")
+    if not rel:
         return
 
-    host = get_target_host(p, lab, vm_name)
-    print(f"Bootstrapping {vm_name} at {host} using {script_rel}")
+    reboot_expected = bool(vm.get("reboot_expected", False))
+    host = resolve_vm_ip(p, lab, vmname)
+    print(f"Bootstrapping {vmname} at {host} using {rel}")
 
     wait_winrm(lab, host)
+    text = read_script(lab_path, rel)
+    remote_ps1 = upload_text_as_ps1(lab, host, text, f"{vmname}-bootstrap.ps1")
 
-    ps = read_script_text(lab_path, script_rel)
-    code, out, err = run_ps_winrm(lab, host, ps, timeout_s=900)
+    env = lab_env(lab, vmname)
 
-    if out:
-        print(out)
-    if err:
-        print(err, file=sys.stderr)
+    try:
+        code, out, err = exec_remote_ps1(lab, host, remote_ps1, env=env)
+        if out.strip():
+            print(out.strip())
+        if code != 0:
+            raise RuntimeError(err.strip() or out.strip())
+    except Exception:
+        if reboot_expected:
+            print(f"⚠️  WinRM disconnected during bootstrap of {vmname} (expected)")
+        else:
+            raise
+
+    if reboot_expected:
+        time.sleep(30)
+        wait_winrm(lab, host)
+
+def apply_break(lab_path, lab, p):
+    br = lab.get("break")
+    if not br:
+        return
+    target = br["target"]
+    rel = br["script"]
+    host = resolve_vm_ip(p, lab, target)
+    print(f"Applying break on {target} ({host})")
+    wait_winrm(lab, host)
+    text = read_script(lab_path, rel)
+    remote_ps1 = upload_text_as_ps1(lab, host, text, f"{target}-break.ps1")
+
+    env = lab_env(lab, target)
+
+    code, out, err = exec_remote_ps1(lab, host, remote_ps1, env=env)
     if code != 0:
-        raise RuntimeError(f"Bootstrap failed on {vm_name} (host={host}) exit={code}")
+        raise RuntimeError(err or out)
 
-    print(f"✅ Bootstrap complete for {vm_name}")
-
-
-def wait_for_domain_ready(lab: Dict[str, Any], p: ProxmoxAPI, dc_vm_name: str, timeout_s: int = 900) -> None:
-    """
-    Wait until AD is ready on the DC (Get-ADDomain succeeds).
-    Assumes ActiveDirectory module will exist after DC promotion.
-    """
-    host = get_target_host(p, lab, dc_vm_name)
-    print(f"Waiting for domain readiness on {dc_vm_name} ({host}) ...")
-
-    script = r"""
-    try {
-      Import-Module ActiveDirectory
-      Get-ADDomain | Out-Null
-      Write-Output "AD_READY"
-      exit 0
-    } catch {
-      exit 1
-    }
-    """
-
-    start = time.time()
-    last = None
-    while time.time() - start < timeout_s:
+# -----------------------------
+# CLEANUP
+# -----------------------------
+def cleanup_run(p, created_vms: List[Tuple[str, int]]):
+    print("🧹 Cleaning up created resources...")
+    for node, vmid in reversed(created_vms):
         try:
-            code, out, err = run_ps_winrm(lab, host, script, timeout_s=30)
-            if code == 0 and "AD_READY" in out:
-                print("✅ AD is ready.")
-                return
-            last = f"code={code} out={out} err={err}"
+            if vm_exists(p, node, vmid):
+                stop_vm(p, node, vmid)
+                destroy_vm(p, node, vmid)
         except Exception as e:
-            last = str(e)
-        time.sleep(10)
-
-    raise TimeoutError(f"AD did not become ready within {timeout_s}s. Last: {last}")
-
+            print(f"Cleanup warning (vm {vmid}): {e}")
 
 # -----------------------------
-# Break application
+# COMMANDS
 # -----------------------------
-
-def apply_break(lab_path: Path, lab: Dict[str, Any], p: ProxmoxAPI) -> None:
-    brk = lab.get("break")
-    if not brk:
-        print("No break section; nothing to apply.")
-        return
-
-    target = brk.get("target")
-    script_rel = brk.get("script")
-    if not target or not script_rel:
-        raise RuntimeError("break.target and break.script are required in lab.yaml")
-
-    host = get_target_host(p, lab, target)
-    print(f"Discovered break target '{target}' at {host}")
-
-    wait_winrm(lab, host)
-
-    ps = read_script_text(lab_path, script_rel)
-    print(f"Running break script: {script_rel}")
-    code, out, err = run_ps_winrm(lab, host, ps, timeout_s=300)
-
-    if out:
-        print(out)
-    if err:
-        print(err, file=sys.stderr)
-    if code != 0:
-        raise RuntimeError(f"Break script failed on {target} (host={host}) exit={code}")
-
-    print("✅ Break applied.")
-
-
-# -----------------------------
-# Commands
-# -----------------------------
-
-def cmd_create(args: argparse.Namespace) -> None:
+def cmd_create(args):
     lab_path = Path(args.lab_yaml)
     lab = load_lab(lab_path)
     p = proxmox()
-    node = str(lab["proxmox"]["node"])
+    node = lab["proxmox"]["node"]
 
-    run_id = args.run_id or str(int(time.time()))
+    run_id = sanitize_tag(args.run_id or str(int(time.time())))
     lab_id = sanitize_tag(lab.get("id", "lab"))
-    run_id_safe = sanitize_tag(run_id)
-    tags = [f"lab-{lab_id}", f"run-{run_id_safe}"]
+    tags = [f"lab-{lab_id}", f"run-{run_id}"]
 
-    # Clone all VMs (in order, but cloning order doesn't matter much)
-    for vm_key, vm in ordered_vms(lab):
-        template = int(vm["template"])
-        vmid = int(vm["vmid"])
-        name = str(vm.get("name") or f"{lab_id}-{vm_key}")
-        full = bool(vm.get("full_clone", True))
-        storage = vm.get("storage")
+    created_vms: List[Tuple[str, int]] = []
 
-        print(f"Cloning {vm_key}: template={template} -> vmid={vmid} name={name} node={node}")
-        clone_vm(p, node, template, vmid, name, full=full, storage=storage, tags=tags)
+    try:
+        # clone
+        for name, vm in ordered_vms(lab):
+            print(f"Cloning {name}")
+            clone_vm(p, node, int(vm["template"]), int(vm["vmid"]), vm.get("name", name), tags)
+            created_vms.append((node, int(vm["vmid"])))
 
-    # Start + bootstrap in deterministic order
-    dc_name: Optional[str] = None
-    for vm_key, vm in ordered_vms(lab):
-        if str(vm.get("role", "")).lower() == "dc":
-            dc_name = vm_key
-            break
+        # start + bootstrap
+        for name, vm in ordered_vms(lab):
+            print(f"Starting {name}")
+            start_vm(p, node, int(vm["vmid"]))
+            time.sleep(15)
+            bootstrap_vm(lab_path, lab, p, name)
 
-    for vm_key, vm in ordered_vms(lab):
-        vmid = int(vm["vmid"])
-        print(f"Starting {vm_key} (vmid={vmid}) ...")
-        start_vm(p, node, vmid)
+        if args.apply_break:
+            apply_break(lab_path, lab, p)
 
-        # Give it a moment before probing agent/winrm
-        time.sleep(max(5, args.wait_seconds))
+        print("✅ Lab created successfully")
 
-        # Apply bootstrap if configured
-        apply_bootstrap(lab_path, lab, p, vm_key)
+    except Exception as e:
+        print(f"❌ Lab creation failed: {e}")
+        if args.auto_cleanup:
+            cleanup_run(p, created_vms)
+        else:
+            print("⚠️ Auto-cleanup disabled; resources left intact")
+        raise
 
-        # If we just bootstrapped the DC, wait until AD is ready before moving on
-        if dc_name and vm_key == dc_name:
-            wait_for_domain_ready(lab, p, dc_name, timeout_s=900)
-
-    if args.apply_break:
-        apply_break(lab_path, lab, p)
-
-    print("✅ Create complete.")
-
-
-def cmd_destroy(args: argparse.Namespace) -> None:
+def cmd_destroy(args):
     lab = load_lab(Path(args.lab_yaml))
     p = proxmox()
-    node = str(lab["proxmox"]["node"])
-
-    # stop first
-    for vm_key, vm in ordered_vms(lab):
+    node = lab["proxmox"]["node"]
+    for name, vm in ordered_vms(lab):
         vmid = int(vm["vmid"])
-        if not vm_exists(p, node, vmid):
-            print(f"{vm_key} (vmid={vmid}) missing, skip stop.")
-            continue
-        print(f"Stopping {vm_key} (vmid={vmid}) ...")
-        stop_vm(p, node, vmid)
-
-    # destroy
-    for vm_key, vm in ordered_vms(lab):
-        vmid = int(vm["vmid"])
-        if not vm_exists(p, node, vmid):
-            print(f"{vm_key} (vmid={vmid}) missing, skip destroy.")
-            continue
-        print(f"Destroying {vm_key} (vmid={vmid}) ...")
-        destroy_vm(p, node, vmid)
-
-    print("🗑️ Destroy complete.")
-
-
-def cmd_reset(args: argparse.Namespace) -> None:
-    print("Reset strategy: destroy-and-rebuild")
-    cmd_destroy(args)
-    cmd_create(args)
-
-
-def cmd_status(args: argparse.Namespace) -> None:
-    lab = load_lab(Path(args.lab_yaml))
-    p = proxmox()
-    node = str(lab["proxmox"]["node"])
-    title = lab.get("title", lab.get("id", "lab"))
-
-    print(f"{title} ({lab.get('id','')})")
-    for vm_key, vm in ordered_vms(lab):
-        vmid = int(vm["vmid"])
-        state = "missing"
         if vm_exists(p, node, vmid):
-            cur = p.nodes(node).qemu(vmid).status.current.get()
-            state = cur.get("status", "unknown")
-        print(f"  {vm_key:6} vmid={vmid:<5} state={state}")
-
-
-def cmd_break(args: argparse.Namespace) -> None:
-    lab_path = Path(args.lab_yaml)
-    lab = load_lab(lab_path)
-    p = proxmox()
-    apply_break(lab_path, lab, p)
-
+            stop_vm(p, node, vmid)
+            destroy_vm(p, node, vmid)
+    print("🗑️ Lab destroyed")
 
 # -----------------------------
 # CLI
 # -----------------------------
-
-def build_parser() -> argparse.ArgumentParser:
-    ap = argparse.ArgumentParser(prog="labctl", description="YAML-driven Proxmox lab controller")
+def main():
+    ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="cmd", required=True)
 
-    def add_common(sp):
-        sp.add_argument("lab_yaml", help="Path to lab.yaml")
-        sp.add_argument("--run-id", help="Optional run id for tagging")
-        sp.add_argument(
-            "--wait-seconds",
-            type=int,
-            default=15,
-            help="Seconds to wait after VM start before probing agent/winrm (default: 15)",
-        )
-        sp.add_argument("--apply-break", action="store_true", help="Apply break after create/reset")
+    c = sub.add_parser("create")
+    c.add_argument("lab_yaml")
+    c.add_argument("--run-id")
+    c.add_argument("--apply-break", action="store_true")
+    c.add_argument("--no-cleanup", dest="auto_cleanup", action="store_false")
+    c.set_defaults(func=cmd_create, auto_cleanup=True)
 
-    sp = sub.add_parser("create", help="Clone + start + bootstrap lab VMs")
-    add_common(sp)
-    sp.set_defaults(func=cmd_create)
+    d = sub.add_parser("destroy")
+    d.add_argument("lab_yaml")
+    d.set_defaults(func=cmd_destroy)
 
-    sp = sub.add_parser("destroy", help="Stop + destroy lab VMs")
-    add_common(sp)
-    sp.set_defaults(func=cmd_destroy)
-
-    sp = sub.add_parser("reset", help="Destroy and rebuild lab VMs")
-    add_common(sp)
-    sp.set_defaults(func=cmd_reset)
-
-    sp = sub.add_parser("status", help="Show VM status")
-    sp.add_argument("lab_yaml", help="Path to lab.yaml")
-    sp.set_defaults(func=cmd_status)
-
-    sp = sub.add_parser("break", help="Apply break only (no create)")
-    sp.add_argument("lab_yaml", help="Path to lab.yaml")
-    sp.set_defaults(func=cmd_break)
-
-    return ap
-
-
-def main() -> None:
-    ap = build_parser()
     args = ap.parse_args()
-    try:
-        args.func(args)
-    except KeyboardInterrupt:
-        print("\nInterrupted.", file=sys.stderr)
-        raise SystemExit(130)
-    except Exception as e:
-        print(f"ERROR: {e}", file=sys.stderr)
-        raise SystemExit(1)
-
+    args.func(args)
 
 if __name__ == "__main__":
     main()
