@@ -1,16 +1,15 @@
 #!/usr/bin/env python3
 """
 labctl.py — Proxmox lab controller (YAML-driven) with:
-- Proxmox API token auth via proxmoxer
+- Proxmox API token auth via proxmoxer (supports .env via python-dotenv)
 - VM clone/start/destroy
-- QEMU Guest Agent IPv4 discovery (no hardcoded IPs required)
-- WinRM execution of PowerShell break/reset scripts
+- QEMU Guest Agent IPv4 discovery (so lab.yaml doesn't need hardcoded IPs)
+- WinRM execution for:
+    - per-VM bootstrap (DC promote / domain join)
+    - per-lab break scripts
 
 Requires:
   pip install proxmoxer pyyaml pywinrm python-dotenv
-
-Env (.env supported):
-  PVE_HOST, PVE_USER, PVE_REALM, PVE_TOKEN_NAME, PVE_TOKEN_VALUE, PVE_VERIFY_SSL
 """
 
 from __future__ import annotations
@@ -21,14 +20,14 @@ import os
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Tuple, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import yaml
 import winrm
 from dotenv import load_dotenv
 from proxmoxer import ProxmoxAPI
 
-# Load .env from current working dir (or repo root if you run there)
+# Load .env from CWD (recommended: run labctl from repo root)
 load_dotenv()
 
 
@@ -38,7 +37,7 @@ load_dotenv()
 
 def env_str(name: str, default: Optional[str] = None, required: bool = False) -> str:
     v = os.getenv(name, default)
-    if required and not v:
+    if required and (v is None or str(v).strip() == ""):
         raise RuntimeError(f"Missing env var: {name}")
     return str(v) if v is not None else ""
 
@@ -101,7 +100,7 @@ def vm_exists(p: ProxmoxAPI, node: str, vmid: int) -> bool:
 def load_lab(path: Path) -> Dict[str, Any]:
     lab = yaml.safe_load(path.read_text(encoding="utf-8"))
     if not isinstance(lab, dict):
-        raise RuntimeError("Invalid lab.yaml (must be a mapping)")
+        raise RuntimeError("Invalid lab.yaml (must be a YAML mapping)")
     for k in ("proxmox", "vms"):
         if k not in lab:
             raise RuntimeError(f"Invalid lab.yaml: missing '{k}'")
@@ -110,11 +109,27 @@ def load_lab(path: Path) -> Dict[str, Any]:
     return lab
 
 
-def read_script_text(lab_yaml_path: Path, rel_path: str) -> str:
-    script_path = (lab_yaml_path.parent / rel_path).resolve()
-    if not script_path.exists():
-        raise FileNotFoundError(f"Script not found: {script_path}")
-    return script_path.read_text(encoding="utf-8")
+def read_script_text(base_path: Path, rel_path: str) -> str:
+    p = (base_path.parent / rel_path).resolve()
+    if not p.exists():
+        raise FileNotFoundError(f"Script not found: {p}")
+    return p.read_text(encoding="utf-8")
+
+
+# -----------------------------
+# Proxmox tag safety
+# -----------------------------
+
+def sanitize_tag(t: str) -> str:
+    # Proxmox tag allowed chars: letters/digits and _ . -
+    out = []
+    for ch in str(t).strip():
+        if ch.isalnum() or ch in ("_", "-", "."):
+            out.append(ch)
+        else:
+            out.append("-")
+    s = "".join(out).strip("-")
+    return s or "tag"
 
 
 # -----------------------------
@@ -170,13 +185,13 @@ def resolve_vm_ipv4(p: ProxmoxAPI, node: str, vmid: int, preferred_subnets: List
     return pick_best_ip(ips, preferred_subnets)
 
 
-def get_target_host(p: ProxmoxAPI, lab: Dict[str, Any], target: str) -> str:
+def get_target_host(p: ProxmoxAPI, lab: Dict[str, Any], vm_name: str) -> str:
     node = str(lab["proxmox"]["node"])
     vms = lab["vms"]
-    if target not in vms:
-        raise RuntimeError(f"Target '{target}' not found in lab.vms")
+    if vm_name not in vms:
+        raise RuntimeError(f"VM '{vm_name}' not found in lab.vms")
 
-    vm = vms[target]
+    vm = vms[vm_name]
     # Backward compatible: if ip is provided, use it.
     if vm.get("ip"):
         return str(vm["ip"])
@@ -222,7 +237,7 @@ def run_ps_winrm(lab: Dict[str, Any], host: str, ps_script: str, timeout_s: int 
     return int(r.status_code), stdout, stderr
 
 
-def wait_winrm(lab: Dict[str, Any], host: str, retries: int = 40, delay_s: int = 5) -> None:
+def wait_winrm(lab: Dict[str, Any], host: str, retries: int = 50, delay_s: int = 5) -> None:
     probe = "Write-Output 'winrm-ok'"
     last = None
     for _ in range(retries):
@@ -241,8 +256,16 @@ def wait_winrm(lab: Dict[str, Any], host: str, retries: int = 40, delay_s: int =
 # VM operations
 # -----------------------------
 
-def clone_vm(p: ProxmoxAPI, node: str, template_id: int, vmid: int, name: str, full: bool = True,
-             storage: Optional[str] = None, tags: Optional[List[str]] = None) -> None:
+def clone_vm(
+    p: ProxmoxAPI,
+    node: str,
+    template_id: int,
+    vmid: int,
+    name: str,
+    full: bool = True,
+    storage: Optional[str] = None,
+    tags: Optional[List[str]] = None,
+) -> None:
     if vm_exists(p, node, vmid):
         raise RuntimeError(f"VMID {vmid} already exists on node {node}")
 
@@ -278,6 +301,114 @@ def destroy_vm(p: ProxmoxAPI, node: str, vmid: int) -> None:
 
 
 # -----------------------------
+# Lab orchestration helpers
+# -----------------------------
+
+def ordered_vms(lab: Dict[str, Any]) -> List[Tuple[str, Dict[str, Any]]]:
+    """
+    Start order:
+      1) role == 'dc'
+      2) everything else
+    """
+    items = list(lab["vms"].items())
+    return sorted(items, key=lambda kv: 0 if str(kv[1].get("role", "")).lower() == "dc" else 1)
+
+
+def apply_bootstrap(lab_path: Path, lab: Dict[str, Any], p: ProxmoxAPI, vm_name: str) -> None:
+    vm = lab["vms"][vm_name]
+    script_rel = vm.get("bootstrap")
+    if not script_rel:
+        print(f"No bootstrap defined for {vm_name}, skipping.")
+        return
+
+    host = get_target_host(p, lab, vm_name)
+    print(f"Bootstrapping {vm_name} at {host} using {script_rel}")
+
+    wait_winrm(lab, host)
+
+    ps = read_script_text(lab_path, script_rel)
+    code, out, err = run_ps_winrm(lab, host, ps, timeout_s=900)
+
+    if out:
+        print(out)
+    if err:
+        print(err, file=sys.stderr)
+    if code != 0:
+        raise RuntimeError(f"Bootstrap failed on {vm_name} (host={host}) exit={code}")
+
+    print(f"✅ Bootstrap complete for {vm_name}")
+
+
+def wait_for_domain_ready(lab: Dict[str, Any], p: ProxmoxAPI, dc_vm_name: str, timeout_s: int = 900) -> None:
+    """
+    Wait until AD is ready on the DC (Get-ADDomain succeeds).
+    Assumes ActiveDirectory module will exist after DC promotion.
+    """
+    host = get_target_host(p, lab, dc_vm_name)
+    print(f"Waiting for domain readiness on {dc_vm_name} ({host}) ...")
+
+    script = r"""
+    try {
+      Import-Module ActiveDirectory
+      Get-ADDomain | Out-Null
+      Write-Output "AD_READY"
+      exit 0
+    } catch {
+      exit 1
+    }
+    """
+
+    start = time.time()
+    last = None
+    while time.time() - start < timeout_s:
+        try:
+            code, out, err = run_ps_winrm(lab, host, script, timeout_s=30)
+            if code == 0 and "AD_READY" in out:
+                print("✅ AD is ready.")
+                return
+            last = f"code={code} out={out} err={err}"
+        except Exception as e:
+            last = str(e)
+        time.sleep(10)
+
+    raise TimeoutError(f"AD did not become ready within {timeout_s}s. Last: {last}")
+
+
+# -----------------------------
+# Break application
+# -----------------------------
+
+def apply_break(lab_path: Path, lab: Dict[str, Any], p: ProxmoxAPI) -> None:
+    brk = lab.get("break")
+    if not brk:
+        print("No break section; nothing to apply.")
+        return
+
+    target = brk.get("target")
+    script_rel = brk.get("script")
+    if not target or not script_rel:
+        raise RuntimeError("break.target and break.script are required in lab.yaml")
+
+    host = get_target_host(p, lab, target)
+    print(f"Discovered break target '{target}' at {host}")
+
+    wait_winrm(lab, host)
+
+    ps = read_script_text(lab_path, script_rel)
+    print(f"Running break script: {script_rel}")
+    code, out, err = run_ps_winrm(lab, host, ps, timeout_s=300)
+
+    if out:
+        print(out)
+    if err:
+        print(err, file=sys.stderr)
+    if code != 0:
+        raise RuntimeError(f"Break script failed on {target} (host={host}) exit={code}")
+
+    print("✅ Break applied.")
+
+
+# -----------------------------
 # Commands
 # -----------------------------
 
@@ -287,30 +418,43 @@ def cmd_create(args: argparse.Namespace) -> None:
     p = proxmox()
     node = str(lab["proxmox"]["node"])
 
-    run_id = args.run_id or f"{int(time.time())}"
-    tags = [f"lab-{lab.get('id','lab')}".replace(":", "-")]
+    run_id = args.run_id or str(int(time.time()))
+    lab_id = sanitize_tag(lab.get("id", "lab"))
+    run_id_safe = sanitize_tag(run_id)
+    tags = [f"lab-{lab_id}", f"run-{run_id_safe}"]
 
-
-    # Clone + start VMs
-    for vm_key, vm in lab["vms"].items():
+    # Clone all VMs (in order, but cloning order doesn't matter much)
+    for vm_key, vm in ordered_vms(lab):
         template = int(vm["template"])
         vmid = int(vm["vmid"])
-        name = str(vm.get("name") or f"{lab.get('id','lab')}-{vm_key}")
+        name = str(vm.get("name") or f"{lab_id}-{vm_key}")
         full = bool(vm.get("full_clone", True))
         storage = vm.get("storage")
 
         print(f"Cloning {vm_key}: template={template} -> vmid={vmid} name={name} node={node}")
         clone_vm(p, node, template, vmid, name, full=full, storage=storage, tags=tags)
 
-    for vm_key, vm in lab["vms"].items():
+    # Start + bootstrap in deterministic order
+    dc_name: Optional[str] = None
+    for vm_key, vm in ordered_vms(lab):
+        if str(vm.get("role", "")).lower() == "dc":
+            dc_name = vm_key
+            break
+
+    for vm_key, vm in ordered_vms(lab):
         vmid = int(vm["vmid"])
         print(f"Starting {vm_key} (vmid={vmid}) ...")
         start_vm(p, node, vmid)
 
-    # settle time before agent/winrm probes
-    if args.wait_seconds > 0:
-        print(f"Waiting {args.wait_seconds}s for guests to boot ...")
-        time.sleep(args.wait_seconds)
+        # Give it a moment before probing agent/winrm
+        time.sleep(max(5, args.wait_seconds))
+
+        # Apply bootstrap if configured
+        apply_bootstrap(lab_path, lab, p, vm_key)
+
+        # If we just bootstrapped the DC, wait until AD is ready before moving on
+        if dc_name and vm_key == dc_name:
+            wait_for_domain_ready(lab, p, dc_name, timeout_s=900)
 
     if args.apply_break:
         apply_break(lab_path, lab, p)
@@ -324,7 +468,7 @@ def cmd_destroy(args: argparse.Namespace) -> None:
     node = str(lab["proxmox"]["node"])
 
     # stop first
-    for vm_key, vm in lab["vms"].items():
+    for vm_key, vm in ordered_vms(lab):
         vmid = int(vm["vmid"])
         if not vm_exists(p, node, vmid):
             print(f"{vm_key} (vmid={vmid}) missing, skip stop.")
@@ -333,7 +477,7 @@ def cmd_destroy(args: argparse.Namespace) -> None:
         stop_vm(p, node, vmid)
 
     # destroy
-    for vm_key, vm in lab["vms"].items():
+    for vm_key, vm in ordered_vms(lab):
         vmid = int(vm["vmid"])
         if not vm_exists(p, node, vmid):
             print(f"{vm_key} (vmid={vmid}) missing, skip destroy.")
@@ -357,7 +501,7 @@ def cmd_status(args: argparse.Namespace) -> None:
     title = lab.get("title", lab.get("id", "lab"))
 
     print(f"{title} ({lab.get('id','')})")
-    for vm_key, vm in lab["vms"].items():
+    for vm_key, vm in ordered_vms(lab):
         vmid = int(vm["vmid"])
         state = "missing"
         if vm_exists(p, node, vmid):
@@ -374,40 +518,6 @@ def cmd_break(args: argparse.Namespace) -> None:
 
 
 # -----------------------------
-# Break application
-# -----------------------------
-
-def apply_break(lab_path: Path, lab: Dict[str, Any], p: ProxmoxAPI) -> None:
-    brk = lab.get("break")
-    if not brk:
-        print("No break section; nothing to apply.")
-        return
-    target = brk.get("target")
-    script_rel = brk.get("script")
-    if not target or not script_rel:
-        raise RuntimeError("break.target and break.script are required in lab.yaml")
-
-    host = get_target_host(p, lab, target)
-    print(f"Discovered target host for '{target}': {host}")
-
-    print(f"Waiting for WinRM on {host} ...")
-    wait_winrm(lab, host)
-
-    ps = read_script_text(lab_path, script_rel)
-    print(f"Running break script: {script_rel}")
-    code, out, err = run_ps_winrm(lab, host, ps, timeout_s=180)
-
-    if out:
-        print(out)
-    if err:
-        print(err, file=sys.stderr)
-    if code != 0:
-        raise RuntimeError(f"Break script failed on {target} ({host}) with exit code {code}")
-
-    print("✅ Break applied.")
-
-
-# -----------------------------
 # CLI
 # -----------------------------
 
@@ -418,10 +528,15 @@ def build_parser() -> argparse.ArgumentParser:
     def add_common(sp):
         sp.add_argument("lab_yaml", help="Path to lab.yaml")
         sp.add_argument("--run-id", help="Optional run id for tagging")
-        sp.add_argument("--wait-seconds", type=int, default=30, help="Boot settle time (default: 30)")
+        sp.add_argument(
+            "--wait-seconds",
+            type=int,
+            default=15,
+            help="Seconds to wait after VM start before probing agent/winrm (default: 15)",
+        )
         sp.add_argument("--apply-break", action="store_true", help="Apply break after create/reset")
 
-    sp = sub.add_parser("create", help="Clone + start lab VMs")
+    sp = sub.add_parser("create", help="Clone + start + bootstrap lab VMs")
     add_common(sp)
     sp.set_defaults(func=cmd_create)
 
