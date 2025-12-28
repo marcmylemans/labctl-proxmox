@@ -1,0 +1,32 @@
+proxmox:
+  node: pve
+
+network:
+  prefer_ipv4_subnets:
+    - 10.0.0.0/24
+
+lab:
+  domain_fqdn: corp.local
+  domain_netbios: CORP
+  prefix: 24
+  gateway: 10.48.30.254
+  dc_ip: 10.48.30.10
+  dhcp:
+    scope_net: 10.48.30.0
+    start: 10.48.30.50
+    end: 10.48.30.200
+
+winrm:
+  username: Administrator
+  password: SuperSecretLabPassword!
+  transport: ntlm
+  port: 5985
+
+vms:
+  dc1:
+    role: dc
+    template: 9000
+    vmid: 100
+    name: lab000-dc1
+    bootstrap: scripts/dc/dc1-firstboot.ps1
+    reboot_expected: true

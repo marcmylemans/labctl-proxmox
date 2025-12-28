@@ -1,6 +1,14 @@
 #!/usr/bin/env python3
 """
-labctl.py — Proxmox lab controller (auto-cleanup + env injection + IP-change-safe WinRM)
+labctl.py — Proxmox lab controller
+
+Features:
+- Proxmox clone/start/destroy
+- WinRM bootstrap (CMD-based; avoids run_ps XML/400 issues)
+- Handles DHCP->static IP transitions
+- Uploads scripts via base64 chunks (CMD length safe)
+- DC bootstrap re-runs until dc1.ready marker exists (convergent/idempotent model)
+- Optional cleanup on failure
 
 Requirements:
   pip install proxmoxer pyyaml pywinrm python-dotenv
@@ -21,18 +29,19 @@ import winrm
 from dotenv import load_dotenv
 from proxmoxer import ProxmoxAPI
 
+
 # -----------------------------
 # ENV
 # -----------------------------
 load_dotenv()
 
-def env_str(name: str, default=None, required=False) -> str:
+def env_str(name: str, default=None, required: bool = False) -> str:
     v = os.getenv(name, default)
-    if required and not v:
+    if required and (v is None or str(v).strip() == ""):
         raise RuntimeError(f"Missing env var: {name}")
     return str(v)
 
-def env_bool(name: str, default=True) -> bool:
+def env_bool(name: str, default: bool = True) -> bool:
     v = os.getenv(name)
     if v is None:
         return default
@@ -44,6 +53,7 @@ PVE_REALM       = env_str("PVE_REALM", "pam")
 PVE_TOKEN_NAME  = env_str("PVE_TOKEN_NAME", required=True)
 PVE_TOKEN_VALUE = env_str("PVE_TOKEN_VALUE", required=True)
 PVE_VERIFY_SSL  = env_bool("PVE_VERIFY_SSL", True)
+
 
 # -----------------------------
 # PROXMOX
@@ -57,7 +67,7 @@ def proxmox() -> ProxmoxAPI:
         verify_ssl=PVE_VERIFY_SSL,
     )
 
-def wait_task(p, node, upid, timeout=900):
+def wait_task(p, node: str, upid: str, timeout: int = 900) -> None:
     start = time.time()
     while True:
         t = p.nodes(node).tasks(upid).status.get()
@@ -69,12 +79,13 @@ def wait_task(p, node, upid, timeout=900):
             raise TimeoutError("Proxmox task timeout")
         time.sleep(2)
 
-def vm_exists(p, node, vmid) -> bool:
+def vm_exists(p, node: str, vmid: int) -> bool:
     try:
         p.nodes(node).qemu(vmid).status.current.get()
         return True
     except Exception:
         return False
+
 
 # -----------------------------
 # YAML
@@ -87,8 +98,8 @@ def load_lab(path: Path) -> Dict[str, Any]:
         raise RuntimeError("Invalid lab.yaml (missing winrm)")
     return lab
 
-def read_script(base: Path, rel: str) -> str:
-    p = (base.parent / rel).resolve()
+def read_script(lab_yaml_path: Path, rel: str) -> str:
+    p = (lab_yaml_path.parent / rel).resolve()
     if not p.exists():
         raise FileNotFoundError(p)
     return p.read_text(encoding="utf-8")
@@ -96,24 +107,19 @@ def read_script(base: Path, rel: str) -> str:
 def sanitize_tag(s: str) -> str:
     return "".join(c if c.isalnum() or c in "-._" else "-" for c in str(s)).strip("-") or "lab"
 
+
 # -----------------------------
 # LAB ENV (inject to scripts)
 # -----------------------------
 def lab_env(lab: Dict[str, Any], vmname: str) -> Dict[str, str]:
-    """
-    Build environment variables for bootstrap/break scripts.
-    Reads from lab.yaml 'lab:' section.
-    """
     cfg = lab.get("lab", {}) or {}
     env: Dict[str, str] = {}
 
-    # Domain (optional; scripts have defaults)
     if "domain_fqdn" in cfg:
         env["LAB_DOMAIN_FQDN"] = str(cfg["domain_fqdn"])
     if "domain_netbios" in cfg:
         env["LAB_DOMAIN_NETBIOS"] = str(cfg["domain_netbios"])
 
-    # Network (optional; DC script requires LAB_DC_IP)
     if "prefix" in cfg:
         env["LAB_PREFIX"] = str(cfg["prefix"])
     if "gateway" in cfg:
@@ -121,11 +127,9 @@ def lab_env(lab: Dict[str, Any], vmname: str) -> Dict[str, str]:
     if "dc_ip" in cfg:
         env["LAB_DC_IP"] = str(cfg["dc_ip"])
 
-    # Optional DSRM password
     if "dsrm_pass" in cfg:
         env["LAB_DSRM_PASS"] = str(cfg["dsrm_pass"])
 
-    # DHCP (optional)
     dhcp = cfg.get("dhcp", {}) or {}
     if "scope_net" in dhcp:
         env["LAB_SCOPE_NET"] = str(dhcp["scope_net"])
@@ -134,12 +138,12 @@ def lab_env(lab: Dict[str, Any], vmname: str) -> Dict[str, str]:
     if "end" in dhcp:
         env["LAB_SCOPE_END"] = str(dhcp["end"])
 
-    # Domain join creds (WS script requires JOIN_PASS)
+    if "dns_forwarders" in cfg:
+        env["LAB_DNS_FORWARDERS"] = str(cfg["dns_forwarders"])
+
     winrm_cfg = lab.get("winrm", {}) or {}
     if "password" in winrm_cfg:
         env["LAB_JOIN_PASS"] = str(winrm_cfg["password"])
-
-    # Optional override join user (else WS script builds CORP\Administrator)
     if "join_user" in cfg:
         env["LAB_JOIN_USER"] = str(cfg["join_user"])
 
@@ -147,21 +151,20 @@ def lab_env(lab: Dict[str, Any], vmname: str) -> Dict[str, str]:
     return env
 
 def _escape_for_cmd_set(value: str) -> str:
-    """
-    Escape characters that break CMD 'set "K=V" && ...' chains.
-    """
+    # Escape cmd metacharacters for 'set "K=V"'
     v = str(value)
-    v = v.replace("^", "^^").replace("&", "^&").replace("<", "^<").replace(">", "^>")
+    v = v.replace("^", "^^").replace("&", "^&").replace("<", "^<").replace(">", "^>").replace("|", "^|")
     return v
+
 
 # -----------------------------
 # GUEST AGENT (IP)
 # -----------------------------
-def agent_call(p, node, vmid, cmd):
+def agent_call(p, node: str, vmid: int, cmd: str):
     return p.nodes(node).qemu(vmid).agent(cmd).get()
 
-def flatten_ipv4(info):
-    ips = []
+def flatten_ipv4(info: Dict[str, Any]) -> List[str]:
+    ips: List[str] = []
     for iface in info.get("result", []):
         for a in iface.get("ip-addresses", []):
             if a.get("ip-address-type") == "ipv4":
@@ -170,15 +173,16 @@ def flatten_ipv4(info):
                     ips.append(ip)
     return ips
 
-def wait_guest_agent(p, node, vmid):
+def wait_guest_agent(p, node: str, vmid: int, timeout_sec: int = 240) -> List[str]:
     last = None
-    for _ in range(80):
+    end = time.time() + timeout_sec
+    while time.time() < end:
         try:
             info = agent_call(p, node, vmid, "network-get-interfaces")
             ips = flatten_ipv4(info)
             if ips:
                 return ips
-            last = "agent ok, no IP yet"
+            last = "agent ok, no IPv4 yet"
         except Exception as e:
             msg = str(e)
             if "501" in msg:
@@ -187,24 +191,28 @@ def wait_guest_agent(p, node, vmid):
         time.sleep(3)
     raise TimeoutError(f"Guest agent not ready: {last}")
 
-def resolve_vm_ip(p, lab, vmname):
+def resolve_vm_ip(p, lab: Dict[str, Any], vmname: str) -> str:
     vm = lab["vms"][vmname]
     if vm.get("ip"):
-        return vm["ip"]
+        return str(vm["ip"])
+
     node = lab["proxmox"]["node"]
     ips = wait_guest_agent(p, node, int(vm["vmid"]))
+
     preferred = lab.get("network", {}).get("prefer_ipv4_subnets", [])
     if preferred:
         nets = [ipaddress.ip_network(n, strict=False) for n in preferred]
         for ip in ips:
             if any(ipaddress.ip_address(ip) in n for n in nets):
                 return ip
+
     return ips[0]
+
 
 # -----------------------------
 # WINRM (CMD ONLY)
 # -----------------------------
-def winrm_cfg(lab):
+def winrm_cfg(lab: Dict[str, Any]) -> Dict[str, Any]:
     w = lab["winrm"]
     return dict(
         username=w["username"],
@@ -215,7 +223,7 @@ def winrm_cfg(lab):
         server_cert_validation=w.get("server_cert_validation", "ignore"),
     )
 
-def winrm_session(lab, host) -> winrm.Session:
+def winrm_session(lab: Dict[str, Any], host: str) -> winrm.Session:
     w = winrm_cfg(lab)
     scheme = "https" if w["use_ssl"] else "http"
     url = f"{scheme}://{host}:{w['port']}/wsman"
@@ -226,7 +234,7 @@ def winrm_session(lab, host) -> winrm.Session:
         server_cert_validation=w["server_cert_validation"],
     )
 
-def wait_winrm(lab, host, timeout_sec=300, delay_sec=5):
+def wait_winrm(lab: Dict[str, Any], host: str, timeout_sec: int = 300, delay_sec: int = 5) -> None:
     last = None
     end = time.time() + timeout_sec
     while time.time() < end:
@@ -241,11 +249,11 @@ def wait_winrm(lab, host, timeout_sec=300, delay_sec=5):
         time.sleep(delay_sec)
     raise TimeoutError(f"WinRM not reachable on {host}: {last}")
 
-def wait_winrm_any(lab, hosts, timeout_sec=900, delay_sec=5):
+def wait_winrm_any(lab: Dict[str, Any], hosts: List[str], timeout_sec: int = 900, delay_sec: int = 5) -> str:
     last = None
     end = time.time() + timeout_sec
 
-    # de-dup while preserving order
+    # de-dup preserving order
     seen = set()
     hosts = [h for h in hosts if h and not (h in seen or seen.add(h))]
 
@@ -263,17 +271,25 @@ def wait_winrm_any(lab, hosts, timeout_sec=900, delay_sec=5):
 
     raise TimeoutError(f"WinRM not reachable on any of {hosts}. Last: {last}")
 
-REMOTE_DIR  = r"C:\Windows\Temp\labctl"
-CHUNK_BYTES = 12000
+def remote_file_exists(lab: Dict[str, Any], host: str, path: str) -> bool:
+    sess = winrm_session(lab, host)
+    r = sess.run_cmd("cmd.exe", ["/c", f'if exist "{path}" (exit 0) else (exit 1)'])
+    return r.status_code == 0
 
-def upload_text_as_ps1(lab, host, text: str, remote_name: str) -> str:
+
+# -----------------------------
+# SCRIPT UPLOAD/EXEC
+# -----------------------------
+REMOTE_DIR  = r"C:\Windows\Temp\labctl"
+CHUNK_BYTES = 3500  # cmd.exe command-line safe chunk size
+
+def upload_text_as_ps1(lab: Dict[str, Any], host: str, text: str, remote_name: str) -> str:
     remote_ps1 = fr"{REMOTE_DIR}\{remote_name}"
     remote_b64 = fr"{remote_ps1}.b64"
     sess = winrm_session(lab, host)
 
-    # prep
     for c in [
-        f'mkdir "{REMOTE_DIR}"',
+        f'if not exist "{REMOTE_DIR}" mkdir "{REMOTE_DIR}"',
         f'del /f /q "{remote_b64}" 2>nul',
         f'del /f /q "{remote_ps1}" 2>nul',
     ]:
@@ -281,15 +297,16 @@ def upload_text_as_ps1(lab, host, text: str, remote_name: str) -> str:
         if r.status_code != 0:
             raise RuntimeError((r.std_err or b"").decode(errors="replace"))
 
-    # upload base64
     b64 = base64.b64encode(text.encode("utf-8")).decode("ascii")
     for i in range(0, len(b64), CHUNK_BYTES):
         chunk = b64[i:i + CHUNK_BYTES]
+        chunk = _escape_for_cmd_set(chunk)
         r = sess.run_cmd("cmd.exe", ["/c", f'echo {chunk}>>"{remote_b64}"'])
         if r.status_code != 0:
-            raise RuntimeError((r.std_err or b"").decode(errors="replace"))
+            out = (r.std_out or b"").decode(errors="replace")
+            err = (r.std_err or b"").decode(errors="replace")
+            raise RuntimeError(f"Failed writing b64 chunk: {out}\n{err}")
 
-    # decode (no powershell, avoids WinRM 400/XML issues)
     r = sess.run_cmd("cmd.exe", ["/c", f'certutil -f -decode "{remote_b64}" "{remote_ps1}" >nul'])
     if r.status_code != 0:
         out = (r.std_out or b"").decode(errors="replace")
@@ -298,11 +315,7 @@ def upload_text_as_ps1(lab, host, text: str, remote_name: str) -> str:
 
     return remote_ps1
 
-def exec_remote_ps1(lab, host, remote_ps1: str, env: Optional[Dict[str, str]] = None):
-    """
-    Execute a .ps1 remotely while injecting env vars via CMD.
-    Avoids run_ps() entirely.
-    """
+def exec_remote_ps1(lab: Dict[str, Any], host: str, remote_ps1: str, env: Optional[Dict[str, str]] = None):
     sess = winrm_session(lab, host)
 
     set_parts: List[str] = []
@@ -318,21 +331,22 @@ def exec_remote_ps1(lab, host, remote_ps1: str, env: Optional[Dict[str, str]] = 
     err = (r.std_err or b"").decode(errors="replace")
     return int(r.status_code), out, err
 
+
 # -----------------------------
 # VM OPS
 # -----------------------------
-def clone_vm(p, node, template, vmid, name, tags):
+def clone_vm(p, node: str, template: int, vmid: int, name: str, tags: List[str]):
     if vm_exists(p, node, vmid):
         raise RuntimeError(f"VMID {vmid} already exists")
     upid = p.nodes(node).qemu(template).clone.post(newid=vmid, name=name, full=1)
     wait_task(p, node, upid)
     p.nodes(node).qemu(vmid).config.post(tags=",".join(tags))
 
-def start_vm(p, node, vmid):
+def start_vm(p, node: str, vmid: int):
     upid = p.nodes(node).qemu(vmid).status.start.post()
     wait_task(p, node, upid)
 
-def stop_vm(p, node, vmid):
+def stop_vm(p, node: str, vmid: int):
     try:
         upid = p.nodes(node).qemu(vmid).status.shutdown.post(timeout=60)
         wait_task(p, node, upid)
@@ -340,88 +354,145 @@ def stop_vm(p, node, vmid):
         upid = p.nodes(node).qemu(vmid).status.stop.post()
         wait_task(p, node, upid)
 
-def destroy_vm(p, node, vmid):
+def destroy_vm(p, node: str, vmid: int):
     upid = p.nodes(node).qemu(vmid).delete()
     wait_task(p, node, upid)
+
 
 # -----------------------------
 # ORDERING
 # -----------------------------
-def ordered_vms(lab):
+def ordered_vms(lab: Dict[str, Any]):
+    # DC first, everything else after
     return sorted(lab["vms"].items(), key=lambda kv: 0 if kv[1].get("role") == "dc" else 1)
 
+
 # -----------------------------
-# BOOTSTRAP / BREAK
+# BOOTSTRAP (CONVERGENT)
 # -----------------------------
-def bootstrap_vm(lab_path, lab, p, vmname):
+def run_bootstrap_until_marker(
+    lab_yaml_path: Path,
+    lab: Dict[str, Any],
+    p,
+    vmname: str,
+    rel_script: str,
+    done_marker: str,
+    max_attempts: int = 8,
+) -> str:
+    """
+    Run bootstrap script multiple times until marker exists.
+    Works because the PS script must be idempotent (phase markers).
+    Handles reboot and DHCP->static transitions.
+    """
+    vm = lab["vms"][vmname]
+    cfg = lab.get("lab", {}) or {}
+
+    # initial candidate IPs
+    candidates: List[str] = []
+    if vm.get("role") == "dc" and cfg.get("dc_ip"):
+        candidates.append(str(cfg["dc_ip"]))
+    try:
+        candidates.append(resolve_vm_ip(p, lab, vmname))
+    except Exception:
+        pass
+
+    host = wait_winrm_any(lab, candidates, timeout_sec=900, delay_sec=5)
+
+    for attempt in range(1, max_attempts + 1):
+        if remote_file_exists(lab, host, done_marker):
+            return host
+
+        print(f"Bootstrap {vmname}: attempt {attempt}/{max_attempts} (host={host})")
+
+        text = read_script(lab_yaml_path, rel_script)
+        remote_ps1 = upload_text_as_ps1(lab, host, text, f"{vmname}-bootstrap.ps1")
+        env = lab_env(lab, vmname)
+
+        try:
+            code, out, err = exec_remote_ps1(lab, host, remote_ps1, env=env)
+            if out.strip():
+                print(out.strip())
+            if code != 0:
+                raise RuntimeError(err.strip() or out.strip())
+        except Exception:
+            # if reboot/WinRM drop, we reconnect and retry
+            print(f"⚠️  WinRM disconnected during bootstrap of {vmname} (expected)")
+            time.sleep(10)
+
+        # Re-resolve and reconnect (IP may have changed)
+        candidates = [host]
+        if vm.get("role") == "dc" and cfg.get("dc_ip"):
+            candidates.insert(0, str(cfg["dc_ip"]))
+        try:
+            candidates.append(resolve_vm_ip(p, lab, vmname))
+        except Exception:
+            pass
+
+        host = wait_winrm_any(lab, candidates, timeout_sec=900, delay_sec=5)
+
+    raise RuntimeError(f"{vmname} bootstrap did not reach marker after {max_attempts} attempts: {done_marker}")
+
+def bootstrap_vm(lab_yaml_path: Path, lab: Dict[str, Any], p, vmname: str) -> None:
     vm = lab["vms"][vmname]
     rel = vm.get("bootstrap")
     if not rel:
         return
 
-    reboot_expected = bool(vm.get("reboot_expected", False))
+    role = vm.get("role", "")
 
-    # initial (usually DHCP) IP
+    if role == "dc":
+        # DC MUST converge to dc1.ready before we continue
+        print(f"Bootstrapping {vmname} (converge to dc1.ready) using {rel}")
+        host = run_bootstrap_until_marker(
+            lab_yaml_path,
+            lab,
+            p,
+            vmname,
+            rel_script=rel,
+            done_marker=r"C:\ProgramData\LabBootstrap\dc1.ready",
+            max_attempts=10,
+        )
+        print(f"DC is ready ✅ (host={host})")
+        return
+
+    # Non-DC: single run
     host = resolve_vm_ip(p, lab, vmname)
     print(f"Bootstrapping {vmname} at {host} using {rel}")
 
     wait_winrm(lab, host, timeout_sec=600, delay_sec=5)
-    text = read_script(lab_path, rel)
+    text = read_script(lab_yaml_path, rel)
     remote_ps1 = upload_text_as_ps1(lab, host, text, f"{vmname}-bootstrap.ps1")
-
     env = lab_env(lab, vmname)
 
-    try:
-        code, out, err = exec_remote_ps1(lab, host, remote_ps1, env=env)
-        if out.strip():
-            print(out.strip())
-        if code != 0:
-            raise RuntimeError(err.strip() or out.strip())
-    except Exception:
-        if reboot_expected:
-            print(f"⚠️  WinRM disconnected during bootstrap of {vmname} (expected)")
-        else:
-            raise
+    code, out, err = exec_remote_ps1(lab, host, remote_ps1, env=env)
+    if out.strip():
+        print(out.strip())
+    if code != 0:
+        raise RuntimeError(err.strip() or out.strip())
 
-    if reboot_expected:
-        # VM might reboot AND change IP (DHCP -> static)
-        time.sleep(10)
 
-        candidates = [host]
-
-        # If you have explicit final DC IP in lab config, try it early
-        cfg = lab.get("lab", {}) or {}
-        if vm.get("role") == "dc" and cfg.get("dc_ip"):
-            candidates.insert(0, str(cfg["dc_ip"]))
-
-        # Also re-resolve via guest agent (may now show the static IP)
-        try:
-            new_ip = resolve_vm_ip(p, lab, vmname)
-            candidates.append(new_ip)
-        except Exception:
-            pass
-
-        host2 = wait_winrm_any(lab, candidates, timeout_sec=900, delay_sec=5)
-        if host2 != host:
-            print(f"Reconnected to {vmname} via WinRM at {host2}")
-
-def apply_break(lab_path, lab, p):
+# -----------------------------
+# BREAK
+# -----------------------------
+def apply_break(lab_yaml_path: Path, lab: Dict[str, Any], p):
     br = lab.get("break")
     if not br:
         return
     target = br["target"]
     rel = br["script"]
+
     host = resolve_vm_ip(p, lab, target)
     print(f"Applying break on {target} ({host})")
-    wait_winrm(lab, host, timeout_sec=600, delay_sec=5)
-    text = read_script(lab_path, rel)
-    remote_ps1 = upload_text_as_ps1(lab, host, text, f"{target}-break.ps1")
 
+    wait_winrm(lab, host, timeout_sec=600, delay_sec=5)
+    text = read_script(lab_yaml_path, rel)
+    remote_ps1 = upload_text_as_ps1(lab, host, text, f"{target}-break.ps1")
     env = lab_env(lab, target)
 
     code, out, err = exec_remote_ps1(lab, host, remote_ps1, env=env)
     if code != 0:
-        raise RuntimeError(err or out)
+        raise RuntimeError(err.strip() or out.strip())
+
 
 # -----------------------------
 # CLEANUP
@@ -436,12 +507,13 @@ def cleanup_run(p, created_vms: List[Tuple[str, int]]):
         except Exception as e:
             print(f"Cleanup warning (vm {vmid}): {e}")
 
+
 # -----------------------------
 # COMMANDS
 # -----------------------------
 def cmd_create(args):
-    lab_path = Path(args.lab_yaml)
-    lab = load_lab(lab_path)
+    lab_yaml_path = Path(args.lab_yaml)
+    lab = load_lab(lab_yaml_path)
     p = proxmox()
     node = lab["proxmox"]["node"]
 
@@ -456,8 +528,7 @@ def cmd_create(args):
         for name, vm in ordered_vms(lab):
             print(f"Cloning {name}")
             clone_vm(
-                p,
-                node,
+                p, node,
                 int(vm["template"]),
                 int(vm["vmid"]),
                 vm.get("name", name),
@@ -465,15 +536,15 @@ def cmd_create(args):
             )
             created_vms.append((node, int(vm["vmid"])))
 
-        # start + bootstrap
+        # start + bootstrap (DC blocks progression until ready)
         for name, vm in ordered_vms(lab):
             print(f"Starting {name}")
             start_vm(p, node, int(vm["vmid"]))
             time.sleep(10)
-            bootstrap_vm(lab_path, lab, p, name)
+            bootstrap_vm(lab_yaml_path, lab, p, name)
 
         if args.apply_break:
-            apply_break(lab_path, lab, p)
+            apply_break(lab_yaml_path, lab, p)
 
         print("✅ Lab created successfully")
 
@@ -495,6 +566,7 @@ def cmd_destroy(args):
             stop_vm(p, node, vmid)
             destroy_vm(p, node, vmid)
     print("🗑️ Lab destroyed")
+
 
 # -----------------------------
 # CLI
