@@ -1,0 +1,22 @@
+
+id: lab-001
+title: When Nothing Looks Broken
+
+proxmox:
+  node: pve01
+
+winrm:
+  username: Administrator
+  password: SuperSecretLabPassword!
+  transport: ntlm
+
+vms:
+  ws1:
+    template: 9001
+    vmid: 101
+    name: lab001-ws1
+    ip: 10.0.0.21
+
+break:
+  target: ws1
+  script: break/break.ps1
