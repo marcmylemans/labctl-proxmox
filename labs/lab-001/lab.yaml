@@ -1,21 +1,31 @@
-
 id: lab-001
-title: When Nothing Looks Broken
+title: "When Nothing Looks Broken"
 
 proxmox:
-  node: pve01
+  node: pve
+
+network:
+  prefer_ipv4_subnets:
+    - 10.0.0.0/24
 
 winrm:
-  username: Administrator
-  password: SuperSecretLabPassword!
-  transport: ntlm
+  username: "Administrator"
+  password: "SuperSecretLabPassword!"
+  transport: "ntlm"
+  port: 5985
+  use_ssl: false
 
 vms:
+  dc1:
+    template: 9000
+    vmid: 100
+    name: lab001-dc1
+    full_clone: true
   ws1:
     template: 9001
     vmid: 101
     name: lab001-ws1
-    ip: 10.0.0.21
+    full_clone: true
 
 break:
   target: ws1
