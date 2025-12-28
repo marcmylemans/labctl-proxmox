@@ -56,21 +56,27 @@ try {
   $If = Get-NetAdapter | Where-Object { $_.Status -eq "Up" } | Select-Object -First 1
   if (-not $If) { throw "No active NIC found." }
 
-  Write-Host "Setting client DNS to DC ($DcIp) ..."
-  Set-DnsClientServerAddress -InterfaceIndex $If.ifIndex -ServerAddresses @($DcIp)
-  ipconfig /flushdns | Out-Null
+  Write-Host "Waiting for DC DNS to become ready (UDP query)..."
 
-  Write-Host "Waiting for DC DNS to respond..."
-  $ok = Wait-Until -TimeoutSec 600 -DelaySec 5 -ScriptBlock {
-    Test-NetConnection -ComputerName $DcIp -Port 53 -InformationLevel Quiet
-  }
-  if (-not $ok) { throw "DC not reachable on DNS port 53 at $DcIp" }
+  # We consider DC DNS "ready" when AD SRV records resolve.
+  # This is much more reliable than TCP port 53 checks.
+  $SrvName = "_ldap._tcp.dc._msdcs.$DomainFqdn"
 
-  Write-Host "Waiting for domain resolution..."
-  $ok = Wait-Until -TimeoutSec 600 -DelaySec 5 -ScriptBlock {
-    try { Resolve-DnsName -Name $DomainFqdn -ErrorAction Stop | Out-Null; $true } catch { $false }
+  $ok = Wait-Until -TimeoutSec 900 -DelaySec 5 -ScriptBlock {
+    try {
+      Resolve-DnsName -Name $SrvName -Type SRV -Server $DcIp -ErrorAction Stop | Out-Null
+      $true
+    } catch { $false }
   }
-  if (-not $ok) { throw "Domain name $DomainFqdn did not resolve via DNS." }
+
+  if (-not $ok) {
+    # As a helpful debug fallback, try a simple A record lookup too
+    try { Resolve-DnsName -Name $DomainFqdn -Server $DcIp -ErrorAction Stop | Out-Null } catch {}
+    throw "DC DNS not ready: SRV lookup failed for $SrvName via $DcIp"
+  }
+
+  Write-Host "DNS SRV records found. Domain DNS is ready."
+
 
   # Already joined?
   $cs = Get-CimInstance Win32_ComputerSystem

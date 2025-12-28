@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-labctl.py — Proxmox lab controller (with auto-cleanup + env injection)
+labctl.py — Proxmox lab controller (auto-cleanup + env injection + IP-change-safe WinRM)
 
 Requirements:
   pip install proxmoxer pyyaml pywinrm python-dotenv
@@ -107,19 +107,17 @@ def lab_env(lab: Dict[str, Any], vmname: str) -> Dict[str, str]:
     cfg = lab.get("lab", {}) or {}
     env: Dict[str, str] = {}
 
-    # Domain (optional - scripts have defaults)
+    # Domain (optional; scripts have defaults)
     if "domain_fqdn" in cfg:
         env["LAB_DOMAIN_FQDN"] = str(cfg["domain_fqdn"])
     if "domain_netbios" in cfg:
         env["LAB_DOMAIN_NETBIOS"] = str(cfg["domain_netbios"])
 
-    # Network
+    # Network (optional; DC script requires LAB_DC_IP)
     if "prefix" in cfg:
         env["LAB_PREFIX"] = str(cfg["prefix"])
     if "gateway" in cfg:
         env["LAB_GW"] = str(cfg["gateway"])
-
-    # DC IP (required by dc script)
     if "dc_ip" in cfg:
         env["LAB_DC_IP"] = str(cfg["dc_ip"])
 
@@ -137,7 +135,6 @@ def lab_env(lab: Dict[str, Any], vmname: str) -> Dict[str, str]:
         env["LAB_SCOPE_END"] = str(dhcp["end"])
 
     # Domain join creds (WS script requires JOIN_PASS)
-    # For now we reuse the same password you already use everywhere.
     winrm_cfg = lab.get("winrm", {}) or {}
     if "password" in winrm_cfg:
         env["LAB_JOIN_PASS"] = str(winrm_cfg["password"])
@@ -146,9 +143,7 @@ def lab_env(lab: Dict[str, Any], vmname: str) -> Dict[str, str]:
     if "join_user" in cfg:
         env["LAB_JOIN_USER"] = str(cfg["join_user"])
 
-    # Per-VM
     env["LAB_VM_NAME"] = vmname
-
     return env
 
 def _escape_for_cmd_set(value: str) -> str:
@@ -231,9 +226,10 @@ def winrm_session(lab, host) -> winrm.Session:
         server_cert_validation=w["server_cert_validation"],
     )
 
-def wait_winrm(lab, host):
+def wait_winrm(lab, host, timeout_sec=300, delay_sec=5):
     last = None
-    for _ in range(60):
+    end = time.time() + timeout_sec
+    while time.time() < end:
         try:
             sess = winrm_session(lab, host)
             r = sess.run_cmd("cmd.exe", ["/c", "echo winrm-ok"])
@@ -242,8 +238,30 @@ def wait_winrm(lab, host):
             last = (r.std_err or r.std_out or b"").decode(errors="replace")
         except Exception as e:
             last = str(e)
-        time.sleep(5)
+        time.sleep(delay_sec)
     raise TimeoutError(f"WinRM not reachable on {host}: {last}")
+
+def wait_winrm_any(lab, hosts, timeout_sec=900, delay_sec=5):
+    last = None
+    end = time.time() + timeout_sec
+
+    # de-dup while preserving order
+    seen = set()
+    hosts = [h for h in hosts if h and not (h in seen or seen.add(h))]
+
+    while time.time() < end:
+        for h in hosts:
+            try:
+                sess = winrm_session(lab, h)
+                r = sess.run_cmd("cmd.exe", ["/c", "echo winrm-ok"])
+                if r.status_code == 0:
+                    return h
+                last = (r.std_err or r.std_out or b"").decode(errors="replace")
+            except Exception as e:
+                last = str(e)
+        time.sleep(delay_sec)
+
+    raise TimeoutError(f"WinRM not reachable on any of {hosts}. Last: {last}")
 
 REMOTE_DIR  = r"C:\Windows\Temp\labctl"
 CHUNK_BYTES = 12000
@@ -342,10 +360,12 @@ def bootstrap_vm(lab_path, lab, p, vmname):
         return
 
     reboot_expected = bool(vm.get("reboot_expected", False))
+
+    # initial (usually DHCP) IP
     host = resolve_vm_ip(p, lab, vmname)
     print(f"Bootstrapping {vmname} at {host} using {rel}")
 
-    wait_winrm(lab, host)
+    wait_winrm(lab, host, timeout_sec=600, delay_sec=5)
     text = read_script(lab_path, rel)
     remote_ps1 = upload_text_as_ps1(lab, host, text, f"{vmname}-bootstrap.ps1")
 
@@ -364,8 +384,26 @@ def bootstrap_vm(lab_path, lab, p, vmname):
             raise
 
     if reboot_expected:
-        time.sleep(30)
-        wait_winrm(lab, host)
+        # VM might reboot AND change IP (DHCP -> static)
+        time.sleep(10)
+
+        candidates = [host]
+
+        # If you have explicit final DC IP in lab config, try it early
+        cfg = lab.get("lab", {}) or {}
+        if vm.get("role") == "dc" and cfg.get("dc_ip"):
+            candidates.insert(0, str(cfg["dc_ip"]))
+
+        # Also re-resolve via guest agent (may now show the static IP)
+        try:
+            new_ip = resolve_vm_ip(p, lab, vmname)
+            candidates.append(new_ip)
+        except Exception:
+            pass
+
+        host2 = wait_winrm_any(lab, candidates, timeout_sec=900, delay_sec=5)
+        if host2 != host:
+            print(f"Reconnected to {vmname} via WinRM at {host2}")
 
 def apply_break(lab_path, lab, p):
     br = lab.get("break")
@@ -375,7 +413,7 @@ def apply_break(lab_path, lab, p):
     rel = br["script"]
     host = resolve_vm_ip(p, lab, target)
     print(f"Applying break on {target} ({host})")
-    wait_winrm(lab, host)
+    wait_winrm(lab, host, timeout_sec=600, delay_sec=5)
     text = read_script(lab_path, rel)
     remote_ps1 = upload_text_as_ps1(lab, host, text, f"{target}-break.ps1")
 
@@ -417,14 +455,21 @@ def cmd_create(args):
         # clone
         for name, vm in ordered_vms(lab):
             print(f"Cloning {name}")
-            clone_vm(p, node, int(vm["template"]), int(vm["vmid"]), vm.get("name", name), tags)
+            clone_vm(
+                p,
+                node,
+                int(vm["template"]),
+                int(vm["vmid"]),
+                vm.get("name", name),
+                tags,
+            )
             created_vms.append((node, int(vm["vmid"])))
 
         # start + bootstrap
         for name, vm in ordered_vms(lab):
             print(f"Starting {name}")
             start_vm(p, node, int(vm["vmid"]))
-            time.sleep(15)
+            time.sleep(10)
             bootstrap_vm(lab_path, lab, p, name)
 
         if args.apply_break:
