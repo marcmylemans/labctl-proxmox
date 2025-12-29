@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """
-labctl.py — Proxmox lab controller
+labctl.py — Proxmox lab controller (Proxmox + WinRM bootstrap)
 
-Features:
-- Proxmox clone/start/destroy
-- WinRM bootstrap (CMD-based; avoids run_ps XML/400 issues)
-- Handles DHCP->static IP transitions
-- Uploads scripts via base64 chunks (CMD length safe)
-- DC bootstrap re-runs until dc1.ready marker exists (convergent/idempotent model)
-- Optional cleanup on failure
+Key behaviors:
+- Clones VMs from templates, starts them, bootstraps via WinRM.
+- DC bootstrap is CONVERGENT: re-runs until dc1.ready exists (handles reboot + DHCP->static).
+- WS bootstrap is CONVERGENT: re-runs/recovers until ws1.ready exists (handles reboot after domain join).
+- Script upload uses base64 chunks (avoids "command line too long").
+- Creates remote dir idempotently (fixes "C:\\Windows\\Temp\\labctl already exists").
+- Optional auto-cleanup on failure.
 
 Requirements:
   pip install proxmoxer pyyaml pywinrm python-dotenv
@@ -115,11 +115,13 @@ def lab_env(lab: Dict[str, Any], vmname: str) -> Dict[str, str]:
     cfg = lab.get("lab", {}) or {}
     env: Dict[str, str] = {}
 
+    # Domain
     if "domain_fqdn" in cfg:
         env["LAB_DOMAIN_FQDN"] = str(cfg["domain_fqdn"])
     if "domain_netbios" in cfg:
         env["LAB_DOMAIN_NETBIOS"] = str(cfg["domain_netbios"])
 
+    # Network
     if "prefix" in cfg:
         env["LAB_PREFIX"] = str(cfg["prefix"])
     if "gateway" in cfg:
@@ -127,9 +129,11 @@ def lab_env(lab: Dict[str, Any], vmname: str) -> Dict[str, str]:
     if "dc_ip" in cfg:
         env["LAB_DC_IP"] = str(cfg["dc_ip"])
 
+    # DSRM
     if "dsrm_pass" in cfg:
         env["LAB_DSRM_PASS"] = str(cfg["dsrm_pass"])
 
+    # DHCP scope (optional)
     dhcp = cfg.get("dhcp", {}) or {}
     if "scope_net" in dhcp:
         env["LAB_SCOPE_NET"] = str(dhcp["scope_net"])
@@ -138,9 +142,11 @@ def lab_env(lab: Dict[str, Any], vmname: str) -> Dict[str, str]:
     if "end" in dhcp:
         env["LAB_SCOPE_END"] = str(dhcp["end"])
 
+    # Optional DNS forwarders
     if "dns_forwarders" in cfg:
         env["LAB_DNS_FORWARDERS"] = str(cfg["dns_forwarders"])
 
+    # Domain join credentials (WS)
     winrm_cfg = lab.get("winrm", {}) or {}
     if "password" in winrm_cfg:
         env["LAB_JOIN_PASS"] = str(winrm_cfg["password"])
@@ -151,7 +157,7 @@ def lab_env(lab: Dict[str, Any], vmname: str) -> Dict[str, str]:
     return env
 
 def _escape_for_cmd_set(value: str) -> str:
-    # Escape cmd metacharacters for 'set "K=V"'
+    # Escape cmd metacharacters for: set "K=V"
     v = str(value)
     v = v.replace("^", "^^").replace("&", "^&").replace("<", "^<").replace(">", "^>").replace("|", "^|")
     return v
@@ -288,6 +294,7 @@ def upload_text_as_ps1(lab: Dict[str, Any], host: str, text: str, remote_name: s
     remote_b64 = fr"{remote_ps1}.b64"
     sess = winrm_session(lab, host)
 
+    # IMPORTANT: mkdir must be idempotent (fixes "already exists")
     for c in [
         f'if not exist "{REMOTE_DIR}" mkdir "{REMOTE_DIR}"',
         f'del /f /q "{remote_b64}" 2>nul',
@@ -377,17 +384,16 @@ def run_bootstrap_until_marker(
     vmname: str,
     rel_script: str,
     done_marker: str,
-    max_attempts: int = 8,
+    max_attempts: int = 10,
 ) -> str:
     """
     Run bootstrap script multiple times until marker exists.
-    Works because the PS script must be idempotent (phase markers).
-    Handles reboot and DHCP->static transitions.
+    Handles reboot and DHCP->static transitions by reconnecting via WinRM on candidate IPs.
     """
     vm = lab["vms"][vmname]
     cfg = lab.get("lab", {}) or {}
 
-    # initial candidate IPs
+    # candidate IPs (static first for DC)
     candidates: List[str] = []
     if vm.get("role") == "dc" and cfg.get("dc_ip"):
         candidates.append(str(cfg["dc_ip"]))
@@ -396,11 +402,16 @@ def run_bootstrap_until_marker(
     except Exception:
         pass
 
-    host = wait_winrm_any(lab, candidates, timeout_sec=900, delay_sec=5)
+    host = wait_winrm_any(lab, candidates, timeout_sec=900, delay_sec=10)
 
     for attempt in range(1, max_attempts + 1):
-        if remote_file_exists(lab, host, done_marker):
-            return host
+        # If marker exists, done
+        try:
+            if remote_file_exists(lab, host, done_marker):
+                return host
+        except Exception:
+            # WinRM can still be flaky; fall through to reconnect below
+            pass
 
         print(f"Bootstrap {vmname}: attempt {attempt}/{max_attempts} (host={host})")
 
@@ -415,11 +426,11 @@ def run_bootstrap_until_marker(
             if code != 0:
                 raise RuntimeError(err.strip() or out.strip())
         except Exception:
-            # if reboot/WinRM drop, we reconnect and retry
+            # Reboot/WinRM drop is expected for DC and WS
             print(f"⚠️  WinRM disconnected during bootstrap of {vmname} (expected)")
             time.sleep(10)
 
-        # Re-resolve and reconnect (IP may have changed)
+        # Reconnect (IP may have changed)
         candidates = [host]
         if vm.get("role") == "dc" and cfg.get("dc_ip"):
             candidates.insert(0, str(cfg["dc_ip"]))
@@ -428,7 +439,7 @@ def run_bootstrap_until_marker(
         except Exception:
             pass
 
-        host = wait_winrm_any(lab, candidates, timeout_sec=900, delay_sec=5)
+        host = wait_winrm_any(lab, candidates, timeout_sec=900, delay_sec=10)
 
     raise RuntimeError(f"{vmname} bootstrap did not reach marker after {max_attempts} attempts: {done_marker}")
 
@@ -441,7 +452,6 @@ def bootstrap_vm(lab_yaml_path: Path, lab: Dict[str, Any], p, vmname: str) -> No
     role = vm.get("role", "")
 
     if role == "dc":
-        # DC MUST converge to dc1.ready before we continue
         print(f"Bootstrapping {vmname} (converge to dc1.ready) using {rel}")
         host = run_bootstrap_until_marker(
             lab_yaml_path,
@@ -450,53 +460,39 @@ def bootstrap_vm(lab_yaml_path: Path, lab: Dict[str, Any], p, vmname: str) -> No
             vmname,
             rel_script=rel,
             done_marker=r"C:\ProgramData\LabBootstrap\dc1.ready",
-            max_attempts=10,
+            max_attempts=12,
         )
         print(f"DC is ready ✅ (host={host})")
         return
 
-        # Non-DC: run + (optionally) wait for reboot completion via ws1.ready
+    if role == "ws":
+        print(f"Bootstrapping {vmname} (converge to ws1.ready) using {rel}")
+        host = run_bootstrap_until_marker(
+            lab_yaml_path,
+            lab,
+            p,
+            vmname,
+            rel_script=rel,
+            done_marker=fr"C:\ProgramData\LabBootstrap\{vmname}.ready",
+            max_attempts=10,
+        )
+        print(f"{vmname} is ready ✅ (host={host})")
+        return
+
+    # Default: single run, no convergence
     host = resolve_vm_ip(p, lab, vmname)
     print(f"Bootstrapping {vmname} at {host} using {rel}")
-
     wait_winrm(lab, host, timeout_sec=600, delay_sec=5)
+
     text = read_script(lab_yaml_path, rel)
     remote_ps1 = upload_text_as_ps1(lab, host, text, f"{vmname}-bootstrap.ps1")
     env = lab_env(lab, vmname)
 
-    try:
-        code, out, err = exec_remote_ps1(lab, host, remote_ps1, env=env)
-        if out.strip():
-            print(out.strip())
-        if code != 0:
-            raise RuntimeError(err.strip() or out.strip())
-    except Exception:
-        # if ws reboots mid-command, reconnect below
-        print(f"⚠️  WinRM disconnected during bootstrap of {vmname} (expected)")
-        time.sleep(10)
-
-    # If this VM is a workstation, wait until it's really back & ready
-    if vm.get("role") == "ws":
-        # IP may change via DHCP; refresh
-        candidates = []
-        try:
-            candidates.append(resolve_vm_ip(p, lab, vmname))
-        except Exception:
-            pass
-        candidates.append(host)
-
-        host = wait_winrm_any(lab, candidates, timeout_sec=900, delay_sec=5)
-
-        # wait for ready marker (created post-reboot)
-        ready_marker = r"C:\ProgramData\LabBootstrap\ws1.ready"
-        for _ in range(180):  # 15 min
-            if remote_file_exists(lab, host, ready_marker):
-                print(f"{vmname} is ready ✅ (host={host})")
-                break
-            time.sleep(5)
-        else:
-            raise RuntimeError(f"{vmname} did not reach ready marker: {ready_marker}")
-
+    code, out, err = exec_remote_ps1(lab, host, remote_ps1, env=env)
+    if out.strip():
+        print(out.strip())
+    if code != 0:
+        raise RuntimeError(err.strip() or out.strip())
 
 
 # -----------------------------
@@ -506,10 +502,24 @@ def apply_break(lab_yaml_path: Path, lab: Dict[str, Any], p):
     br = lab.get("break")
     if not br:
         return
+
     target = br["target"]
     rel = br["script"]
-    
-    # IP may have changed after reboot; prefer fresh resolve
+
+    # If target is a workstation, make sure it is ready before breaking it
+    t_vm = lab["vms"].get(target, {})
+    if t_vm.get("role") == "ws":
+        # This is quick if already ready; safe if it rebooted and got a new IP
+        run_bootstrap_until_marker(
+            lab_yaml_path,
+            lab,
+            p,
+            target,
+            rel_script=t_vm.get("bootstrap", rel),  # doesn't really matter; marker check exits fast
+            done_marker=fr"C:\ProgramData\LabBootstrap\{target}.ready",
+            max_attempts=2,
+        )
+
     host = resolve_vm_ip(p, lab, target)
     print(f"Applying break on {target} ({host})")
 
@@ -565,11 +575,11 @@ def cmd_create(args):
             )
             created_vms.append((node, int(vm["vmid"])))
 
-        # start + bootstrap (DC blocks progression until ready)
+        # start + bootstrap (DC blocks progression until ready; WS blocks until ready)
         for name, vm in ordered_vms(lab):
             print(f"Starting {name}")
             start_vm(p, node, int(vm["vmid"]))
-            time.sleep(10)
+            time.sleep(10)  # give guest agent & services a head start
             bootstrap_vm(lab_yaml_path, lab, p, name)
 
         if args.apply_break:
