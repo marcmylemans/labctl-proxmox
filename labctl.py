@@ -455,7 +455,7 @@ def bootstrap_vm(lab_yaml_path: Path, lab: Dict[str, Any], p, vmname: str) -> No
         print(f"DC is ready ✅ (host={host})")
         return
 
-    # Non-DC: single run
+        # Non-DC: run + (optionally) wait for reboot completion via ws1.ready
     host = resolve_vm_ip(p, lab, vmname)
     print(f"Bootstrapping {vmname} at {host} using {rel}")
 
@@ -464,11 +464,39 @@ def bootstrap_vm(lab_yaml_path: Path, lab: Dict[str, Any], p, vmname: str) -> No
     remote_ps1 = upload_text_as_ps1(lab, host, text, f"{vmname}-bootstrap.ps1")
     env = lab_env(lab, vmname)
 
-    code, out, err = exec_remote_ps1(lab, host, remote_ps1, env=env)
-    if out.strip():
-        print(out.strip())
-    if code != 0:
-        raise RuntimeError(err.strip() or out.strip())
+    try:
+        code, out, err = exec_remote_ps1(lab, host, remote_ps1, env=env)
+        if out.strip():
+            print(out.strip())
+        if code != 0:
+            raise RuntimeError(err.strip() or out.strip())
+    except Exception:
+        # if ws reboots mid-command, reconnect below
+        print(f"⚠️  WinRM disconnected during bootstrap of {vmname} (expected)")
+        time.sleep(10)
+
+    # If this VM is a workstation, wait until it's really back & ready
+    if vm.get("role") == "ws":
+        # IP may change via DHCP; refresh
+        candidates = []
+        try:
+            candidates.append(resolve_vm_ip(p, lab, vmname))
+        except Exception:
+            pass
+        candidates.append(host)
+
+        host = wait_winrm_any(lab, candidates, timeout_sec=900, delay_sec=5)
+
+        # wait for ready marker (created post-reboot)
+        ready_marker = r"C:\ProgramData\LabBootstrap\ws1.ready"
+        for _ in range(180):  # 15 min
+            if remote_file_exists(lab, host, ready_marker):
+                print(f"{vmname} is ready ✅ (host={host})")
+                break
+            time.sleep(5)
+        else:
+            raise RuntimeError(f"{vmname} did not reach ready marker: {ready_marker}")
+
 
 
 # -----------------------------
@@ -480,7 +508,8 @@ def apply_break(lab_yaml_path: Path, lab: Dict[str, Any], p):
         return
     target = br["target"]
     rel = br["script"]
-
+    
+    # IP may have changed after reboot; prefer fresh resolve
     host = resolve_vm_ip(p, lab, target)
     print(f"Applying break on {target} ({host})")
 

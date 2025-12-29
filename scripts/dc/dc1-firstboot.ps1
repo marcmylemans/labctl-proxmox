@@ -1,139 +1,221 @@
-# dc1-firstboot.ps1
-# Run once on first boot after sysprep.
-# Creates AD DS forest + DNS + DHCP baseline for labs.
-
+# dc1-firstboot.ps1 (PowerShell 5.1 compatible)
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
 
 # -----------------------------
-# CONFIG (edit these)
+# Helpers (PS 5.1 compatible defaults)
 # -----------------------------
-$DomainFqdn        = "corp.local"
-$NetbiosName       = "CORP"
-$SafeModeAdminPass = "P@ssw0rd!ChangeMe"   # DSRM password (lab only)
+function Get-EnvOrDefault([string]$Name, [string]$DefaultValue) {
+  $v = [Environment]::GetEnvironmentVariable($Name)
+  if ([string]::IsNullOrWhiteSpace($v)) { return $DefaultValue }
+  return $v
+}
+function Get-EnvRequired([string]$Name) {
+  $v = [Environment]::GetEnvironmentVariable($Name)
+  if ([string]::IsNullOrWhiteSpace($v)) { throw "$Name not set" }
+  return $v
+}
 
-# Network for DHCP scope (adjust to your lab)
-$ScopeNetwork      = "10.0.0.0"
-$ScopePrefix       = 24
-$ScopeStart        = "10.0.0.50"
-$ScopeEnd          = "10.0.0.200"
-$Router            = "10.0.0.1"           # optional, can be empty if none
-$DnsServer         = "10.0.0.10"          # DC1 intended IP
+# -----------------------------
+# INPUT (injected by labctl via env)
+# -----------------------------
+$DomainFqdn        = Get-EnvOrDefault "LAB_DOMAIN_FQDN"    "corp.local"
+$NetbiosName       = Get-EnvOrDefault "LAB_DOMAIN_NETBIOS" "CORP"
+$DcIp              = Get-EnvRequired  "LAB_DC_IP"
+$PrefixLength      = [int](Get-EnvOrDefault "LAB_PREFIX" "24")
+$Gateway           = Get-EnvOrDefault "LAB_GW" ""   # optional
+$SafeModeAdminPass = Get-EnvOrDefault "LAB_DSRM_PASS" "LabDSRM123!"
 
-# Optional: create a lab user for testing
-$CreateLabUser     = $true
-$LabUsername       = "labuser"
-$LabUserPassword   = "P@ssw0rd!ChangeMe"
+# DHCP options (optional)
+$DhcpScopeNetwork  = Get-EnvOrDefault "LAB_SCOPE_NET"   "10.48.30.0"
+$DhcpScopeStart    = Get-EnvOrDefault "LAB_SCOPE_START" "10.48.30.50"
+$DhcpScopeEnd 	    = Get-EnvOrDefault "LAB_SCOPE_END"   "10.48.30.200"
 
-# Marker
-$MarkerDir         = "C:\ProgramData\LabBootstrap"
-$MarkerFile        = Join-Path $MarkerDir "dc1.done"
-$LogFile           = Join-Path $MarkerDir "dc1-firstboot.log"
+# Optional DNS forwarders (comma separated, e.g. "1.1.1.1,8.8.8.8")
+$DnsForwarders     = Get-EnvOrDefault "LAB_DNS_FORWARDERS" ""
 
-New-Item -ItemType Directory -Path $MarkerDir -Force | Out-Null
+# -----------------------------
+# MARKERS
+# -----------------------------
+$StateDir        = "C:\ProgramData\LabBootstrap"
+$NetDone         = Join-Path $StateDir "phase-network.done"
+$PromoteStarted  = Join-Path $StateDir "phase-ad.promote-started"
+$AdDone          = Join-Path $StateDir "phase-ad.done"
+$Phase3Done      = Join-Path $StateDir "phase-services.done"
+$ReadyMarker     = Join-Path $StateDir "dc1.ready"
+$AllDone         = Join-Path $StateDir "dc1.done"
+$LogFile         = Join-Path $StateDir "dc1-firstboot.log"
+
+New-Item -ItemType Directory -Path $StateDir -Force | Out-Null
 Start-Transcript -Path $LogFile -Append | Out-Null
 
 try {
-  if (Test-Path $MarkerFile) {
-    Write-Host "DC bootstrap already done ($MarkerFile exists). Exiting."
-    return
-  }
-
   Write-Host "=== DC1 bootstrap start: $(Get-Date) ==="
 
-  # Pick first active NIC
-  $If = Get-NetAdapter | Where-Object Status -eq "Up" | Select-Object -First 1
-  if (-not $If) { throw "No active NIC found." }
+  # -----------------------------
+  # PHASE 1 — NETWORK
+  # -----------------------------
+  if (-not (Test-Path $NetDone)) {
+    Write-Host "Phase 1: configuring static network..."
 
-  # Ensure DC uses itself for DNS
-  Write-Host "Setting DNS server on DC NIC to $DnsServer ..."
-  Set-DnsClientServerAddress -InterfaceIndex $If.ifIndex -ServerAddresses @($DnsServer)
+    $If = Get-NetAdapter | Where-Object { $_.Status -eq "Up" } | Select-Object -First 1
+    if (-not $If) { throw "No active NIC found" }
 
-  # Install roles
-  Write-Host "Installing AD DS + DNS..."
-  Install-WindowsFeature AD-Domain-Services, DNS -IncludeManagementTools | Out-Null
+    # Remove DHCP IPv4 address if present
+    $dhcpIps = Get-NetIPAddress -InterfaceIndex $If.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+      Where-Object { $_.PrefixOrigin -eq "Dhcp" }
 
-  # Promote if not already a DC
-  $isDc = $false
-  try {
-    $null = Get-ADDomain -ErrorAction Stop
-    $isDc = $true
-  } catch { $isDc = $false }
+    foreach ($ip in $dhcpIps) {
+      Write-Host "Removing DHCP IP $($ip.IPAddress)"
+      Remove-NetIPAddress -InterfaceIndex $If.ifIndex -IPAddress $ip.IPAddress -Confirm:$false -ErrorAction SilentlyContinue
+    }
 
-  if (-not $isDc) {
-    Write-Host "Promoting to new forest: $DomainFqdn ..."
-    $sec = ConvertTo-SecureString $SafeModeAdminPass -AsPlainText -Force
+    # Assign static IP if not already present
+    $hasIp = Get-NetIPAddress -InterfaceIndex $If.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+      Where-Object { $_.IPAddress -eq $DcIp }
 
-    Install-ADDSForest `
-      -DomainName $DomainFqdn `
-      -DomainNetbiosName $NetbiosName `
-      -SafeModeAdministratorPassword $sec `
-      -InstallDNS `
-      -Force `
-      -NoRebootOnCompletion
+    if (-not $hasIp) {
+      Write-Host "Assigning static IP $DcIp/$PrefixLength"
+      if ([string]::IsNullOrWhiteSpace($Gateway)) {
+        New-NetIPAddress -InterfaceIndex $If.ifIndex -IPAddress $DcIp -PrefixLength $PrefixLength | Out-Null
+      } else {
+        New-NetIPAddress -InterfaceIndex $If.ifIndex -IPAddress $DcIp -PrefixLength $PrefixLength -DefaultGateway $Gateway | Out-Null
+      }
+    }
 
-    Write-Host "AD DS promotion completed. Rebooting..."
+    # DNS client points to itself only (best practice)
+    Write-Host "Setting NIC DNS to self ($DcIp)"
+    Set-DnsClientServerAddress -InterfaceIndex $If.ifIndex -ServerAddresses @($DcIp)
+
+    New-Item -ItemType File -Path $NetDone -Force | Out-Null
+    Write-Host "Network configured. Rebooting..."
     Restart-Computer -Force
     return
   }
 
-  Write-Host "AD DS already present. Continuing with DHCP + objects."
+  # -----------------------------
+  # PHASE 2 — AD DS + DNS (resume-safe)
+  # -----------------------------
+  if (-not (Test-Path $AdDone)) {
+    Write-Host "Phase 2: installing AD DS + DNS..."
+    Install-WindowsFeature AD-Domain-Services, DNS -IncludeManagementTools | Out-Null
 
-  # DHCP
-  Write-Host "Installing DHCP..."
-  Install-WindowsFeature DHCP -IncludeManagementTools | Out-Null
+    $isDcReady = $false
+    try {
+      Import-Module ActiveDirectory -ErrorAction Stop
+      Get-ADDomain -ErrorAction Stop | Out-Null
+      $isDcReady = $true
+    } catch { $isDcReady = $false }
 
-  # Authorize DHCP in AD (safe if already authorized)
-  try {
-    Add-DhcpServerInDC -DnsName $env:COMPUTERNAME -IPAddress $DnsServer -ErrorAction SilentlyContinue | Out-Null
-  } catch {}
+    if (-not $isDcReady) {
+      if (-not (Test-Path $PromoteStarted)) {
+        Write-Host "Promoting new forest $DomainFqdn"
+        $sec = ConvertTo-SecureString $SafeModeAdminPass -AsPlainText -Force
 
-  # Create scope if missing
-  $scopeId = $ScopeNetwork
-  $existing = Get-DhcpServerv4Scope -ErrorAction SilentlyContinue | Where-Object { $_.ScopeId.IPAddressToString -eq $scopeId }
-  if (-not $existing) {
-    Write-Host "Creating DHCP scope $ScopeNetwork/$ScopePrefix ..."
-    Add-DhcpServerv4Scope -Name "LAB" -StartRange $ScopeStart -EndRange $ScopeEnd -SubnetMask (("255.255.255.0")) -State Active | Out-Null
-    # NOTE: SubnetMask above assumes /24; for other prefixes, set mask accordingly.
-  } else {
-    Write-Host "DHCP scope already exists."
-  }
+        Install-ADDSForest `
+          -DomainName $DomainFqdn `
+          -DomainNetbiosName $NetbiosName `
+          -SafeModeAdministratorPassword $sec `
+          -InstallDNS `
+          -Force `
+          -NoRebootOnCompletion
 
-  # Set options (006 DNS, 015 DNS suffix, 003 router optional)
-  Write-Host "Setting DHCP options..."
-  Set-DhcpServerv4OptionValue -DnsDomain $DomainFqdn -DnsServer $DnsServer | Out-Null
-  if ($Router -and $Router.Trim().Length -gt 0) {
-    Set-DhcpServerv4OptionValue -Router $Router | Out-Null
-  }
-
-  # Create lab user (optional)
-  if ($CreateLabUser) {
-    Import-Module ActiveDirectory
-    $ouDn = "OU=LabUsers,DC=" + ($DomainFqdn -split "\." -join ",DC=")
-
-    if (-not (Get-ADOrganizationalUnit -LDAPFilter "(ou=LabUsers)" -ErrorAction SilentlyContinue)) {
-      Write-Host "Creating OU LabUsers..."
-      New-ADOrganizationalUnit -Name "LabUsers" -Path ("DC=" + ($DomainFqdn -split "\." -join ",DC=")) | Out-Null
+        # IMPORTANT: only mark 'started' here, NOT done
+        New-Item -ItemType File -Path $PromoteStarted -Force | Out-Null
+        Write-Host "AD promotion initiated. Rebooting..."
+        Restart-Computer -Force
+        return
+      } else {
+        # promotion was started earlier; we are likely post-reboot. Wait for AD to become available.
+        Write-Host "Promotion was started earlier. Waiting for AD to become available..."
+        $ok = $false
+        for ($i=0; $i -lt 120; $i++) { # 10 minutes
+          try {
+            Import-Module ActiveDirectory -ErrorAction Stop
+            Get-ADDomain -ErrorAction Stop | Out-Null
+            $ok = $true
+            break
+          } catch {
+            Start-Sleep -Seconds 5
+          }
+        }
+        if (-not $ok) { throw "AD did not become available after promotion timeout" }
+      }
     }
 
-    $u = Get-ADUser -Filter "SamAccountName -eq '$LabUsername'" -ErrorAction SilentlyContinue
-    if (-not $u) {
-      Write-Host "Creating user $LabUsername ..."
-      $up = ConvertTo-SecureString $LabUserPassword -AsPlainText -Force
-      New-ADUser `
-        -Name $LabUsername `
-        -SamAccountName $LabUsername `
-        -UserPrincipalName "$LabUsername@$DomainFqdn" `
-        -Path $ouDn `
-        -AccountPassword $up `
-        -Enabled $true | Out-Null
-      Add-ADGroupMember -Identity "Domain Users" -Members $LabUsername -ErrorAction SilentlyContinue
+    # Only now we can safely mark Phase 2 done
+    New-Item -ItemType File -Path $AdDone -Force | Out-Null
+    Write-Host "Phase 2 complete."
+  }
+
+  # -----------------------------
+  # PHASE 3 — DNS forwarders + DHCP (idempotent)
+  # -----------------------------
+  if (-not (Test-Path $Phase3Done)) {
+    Write-Host "Phase 3: DNS forwarders + DHCP..."
+
+    # Optional forwarders (don’t hardcode public DNS)
+    if (-not [string]::IsNullOrWhiteSpace($DnsForwarders)) {
+      try {
+        $ips = $DnsForwarders -split "," | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne "" }
+        if ($ips.Count -gt 0) {
+          Add-DnsServerForwarder -IPAddress $ips -ErrorAction SilentlyContinue | Out-Null
+          Write-Host "Configured DNS forwarders: $DnsForwarders"
+        }
+      } catch {}
     } else {
-      Write-Host "User $LabUsername already exists."
+      Write-Host "No DNS forwarders configured (LAB_DNS_FORWARDERS empty)."
     }
+
+    # DHCP Server (optional; keep if you want clients to DHCP inside lab)
+    Install-WindowsFeature DHCP -IncludeManagementTools | Out-Null
+    try { Add-DhcpServerInDC -DnsName $env:COMPUTERNAME -IPAddress $DcIp -ErrorAction SilentlyContinue | Out-Null } catch {}
+
+    $scopeId = $DhcpScopeNetwork
+    $existing = Get-DhcpServerv4Scope -ErrorAction SilentlyContinue | Where-Object { $_.ScopeId.IPAddressToString -eq $scopeId }
+    if (-not $existing) {
+      Write-Host "Creating DHCP scope $scopeId"
+      Add-DhcpServerv4Scope -Name "LAB" -StartRange $DhcpScopeStart -EndRange $DhcpScopeEnd -SubnetMask "255.255.255.0" -State Active | Out-Null
+    }
+
+    Set-DhcpServerv4OptionValue -DnsDomain $DomainFqdn -DnsServer $DcIp | Out-Null
+    if (-not [string]::IsNullOrWhiteSpace($Gateway)) {
+      Set-DhcpServerv4OptionValue -Router $Gateway | Out-Null
+    }
+
+    New-Item -ItemType File -Path $Phase3Done -Force | Out-Null
+    Write-Host "Phase 3 complete."
   }
 
-  New-Item -ItemType File -Path $MarkerFile -Force | Out-Null
+  # -----------------------------
+  # READY GATE — SRV records + Netlogon
+  # -----------------------------
+  Write-Host "Waiting for Netlogon..."
+  $svcOk = $false
+  for ($i=0; $i -lt 60; $i++) {
+    $svc = Get-Service Netlogon -ErrorAction SilentlyContinue
+    if ($svc -and $svc.Status -eq "Running") { $svcOk = $true; break }
+    Start-Sleep -Seconds 5
+  }
+  if (-not $svcOk) { throw "Netlogon not running after timeout" }
+
+  Write-Host "Waiting for AD DNS SRV records to appear..."
+  $Srv = "_ldap._tcp.dc._msdcs.$DomainFqdn"
+  $ready = $false
+  for ($i=0; $i -lt 120; $i++) { # 10 minutes
+    try {
+      Resolve-DnsName -Name $Srv -Type SRV -Server 127.0.0.1 -ErrorAction Stop | Out-Null
+      $ready = $true
+      break
+    } catch {
+      Start-Sleep -Seconds 5
+    }
+  }
+  if (-not $ready) { throw "AD DNS SRV records not ready after timeout" }
+
+  New-Item -ItemType File -Path $ReadyMarker -Force | Out-Null
+  New-Item -ItemType File -Path $AllDone -Force | Out-Null
+  Write-Host "DC is fully ready ✅"
   Write-Host "=== DC1 bootstrap complete ==="
 }
 finally {
